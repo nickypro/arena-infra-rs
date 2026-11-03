@@ -44,7 +44,9 @@ earlier).
 - None of these is the machine's fault: `up --check` keeps the machine (`READY … check pass, course
   setup fail`) and never replaces or remembers it for one. A kernel that can't import torch is the
   image's: the name FAILs as software/setup, left running.
-- The dashboard's detail view has a `course:` line from the last deep check.
+- The dashboard's detail view has a `course:` line from the last deep check. Its HLTH column and
+  the daily health line count these checks as `--deep` does: a course FAIL fails them, and a pod
+  not on today's branch WARNs.
 - `--json` gains `facts.identity`, `facts.repo`, `facts.push`, `facts.claude`, `facts.kernel`,
   `facts.uv` and `facts.wandb`, and the checks `proxy`, `backup`, `repo`, `claude`, `kernel`, `uv`,
   `wandb`. `--deep` now exits non-zero on a course FAIL.

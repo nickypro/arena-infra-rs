@@ -45,7 +45,8 @@ def scrub(text):
 
 
 def kv(k, v):
-    print(f"claude.{k}={scrub(one(v))}", flush=True)
+    # Scrubbed whole, before anything is joined or clipped: no part of a secret survives a cut.
+    print(f"claude.{k}={one(scrub(str(v)))}", flush=True)
 
 
 def fingerprint(s):
@@ -84,9 +85,9 @@ def call(url, headers, body=None):
             ans = {}
         err = ans.get("error") if isinstance(ans, dict) else None
         msg = (err.get("message") if isinstance(err, dict) else err) or (ans.get("message") if isinstance(ans, dict) else "")
-        return e.code, one(msg or e.reason, 160)
+        return e.code, str(msg or e.reason)[:16384]
     except Exception as e:  # unreachable, a timeout, TLS
-        return 0, one(getattr(e, "reason", e), 160)
+        return 0, str(getattr(e, "reason", e))[:16384]
 
 
 def main():
@@ -144,15 +145,21 @@ def main():
     api = (base or os.environ.get("ARENA_ANTHROPIC_URL") or "https://api.anthropic.com").rstrip("/")
     host = (urllib.parse.urlsplit(base).hostname or "") if base else ""
     version = {"anthropic-version": "2023-06-01"}
-    if kind == "api_key":
-        # Free: the models list spends nothing.
-        what, (code, msg) = "models", call(f"{api}/v1/models?limit=1", {"x-api-key": secret, **version})
-    elif kind == "bearer" and (host == "openrouter.ai" or host.endswith(".openrouter.ai")):
-        # Free: OpenRouter's key endpoint, as the AI key's check asks it.
+    openrouter = kind == "bearer" and (host == "openrouter.ai" or host.endswith(".openrouter.ai"))
+    if openrouter:
+        # Free and exact: OpenRouter's key endpoint, as the AI key's check asks it (its limits
+        # and money are that check's), with or without `--claude-call`.
         url = os.environ.get("ARENA_OPENROUTER_URL") or "https://openrouter.ai/api/v1/key"
         what, (code, msg) = "openrouter", call(url, {"Authorization": f"Bearer {secret}"})
+    elif kind == "api_key" and not paid:
+        # Free: the models list spends nothing.
+        what, (code, msg) = "models", call(f"{api}/v1/models?limit=1", {"x-api-key": secret, **version})
     elif paid:
-        headers = {"Authorization": f"Bearer {secret}", "content-type": "application/json", **version}
+        headers = {"content-type": "application/json", **version}
+        if kind == "api_key":
+            headers["x-api-key"] = secret
+        else:
+            headers["Authorization"] = f"Bearer {secret}"
         if kind == "oauth":
             headers["anthropic-beta"] = "oauth-2025-04-20"
         body = {
@@ -168,7 +175,8 @@ def main():
     kv("call", what)
     kv("http", code)
     if msg:
-        kv("error", msg)
+        # Scrubbed first (`kv`), then clipped for a NOTES cell.
+        kv("error", one(scrub(msg), 160))
 
 
 if __name__ == "__main__":

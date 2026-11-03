@@ -1,9 +1,11 @@
 """arena pods test: the course env's notebook kernel. Run by the env's own python (argv[1]), it
-lists the Jupyter kernels that run that python, starts one, runs `import torch` in it and stops
-it. Prints only `kernel.<fact>=<value>` lines (the deep check's contract). The kernel's pid goes
-to argv[2], for the script to kill its process group whatever happens here; the file is removed
-once the kernel is shut down. Its runtime files and IPython's live in the script's temp dir
-(JUPYTER_RUNTIME_DIR, IPYTHONDIR): nothing of the participant's is written."""
+lists the Jupyter kernels that run that python (an ipykernel, its `bin/python`), starts one in the
+script's temp dir, runs `import torch` in it, checks it is that env (`sys.prefix`) and stops it.
+Prints only `kernel.<fact>=<value>` lines (the deep check's contract). The kernel's pid goes to
+argv[2], for the script to kill its process group whatever happens here; the file is removed once
+the kernel is shut down. Its runtime files and IPython's live in the temp dir (JUPYTER_RUNTIME_DIR,
+IPYTHONDIR, set into the kernel's own environment over whatever its spec says): nothing of the
+participant's is written."""
 
 import os
 import signal
@@ -26,12 +28,18 @@ def err(e):
     return f"error: {type(e).__name__}: {e}"
 
 
-def runs_this_python(argv, real):
-    """A spec runs this python: its argv[0] is it, or a bare `python` jupyter_client launches as
-    the python that starts it (this one)."""
+# What the kernel gets in its environment whatever its spec says: the temp dir's, and no bytecode.
+ISOLATION = ("JUPYTER_RUNTIME_DIR", "IPYTHONDIR", "PYTHONDONTWRITEBYTECODE")
+
+
+def runs_this_python(argv, bindir):
+    """A spec runs this env's ipykernel: argv[0] is a python in this env's `bin` (the directory
+    compared, never the interpreter it links to — two venvs share one), or a bare `python`
+    jupyter_client launches as the python that starts it (this one); and it starts ipykernel."""
     exe = argv[0] if argv else ""
     bare = exe in ("python", "python3", f"python{sys.version_info[0]}.{sys.version_info[1]}")
-    return bare or (os.path.isabs(exe) and os.path.realpath(exe) == real)
+    ours = os.path.isabs(exe) and os.path.realpath(os.path.dirname(exe)) == bindir
+    return (bare or ours) and any(a.startswith("ipykernel") for a in argv[1:])
 
 
 def main():
@@ -48,7 +56,8 @@ def main():
     except BaseException as e:
         kv("specs", err(e))
         return
-    real = os.path.realpath(envpy)
+    bindir = os.path.realpath(os.path.dirname(envpy))
+    prefix = os.path.realpath(os.path.dirname(bindir))
     builtin = os.path.dirname(os.path.realpath(ipykernel.__file__))
     try:
         specs = KernelSpecManager().get_all_specs()
@@ -58,7 +67,7 @@ def main():
     mine, registered = [], []
     for name, s in sorted(specs.items()):
         argv = (s.get("spec") or {}).get("argv") or []
-        if not runs_this_python(argv, real):
+        if not runs_this_python(argv, bindir):
             continue
         mine.append(name)
         # Registered: an `ipykernel install` wrote it (an absolute path to this python), not the
@@ -73,11 +82,14 @@ def main():
     name = (registered or mine)[0]
     kv("name", name)
     km = KernelManager(kernel_name=name)
+    # The spec's own `env` is laid over ours at launch: the isolation goes into it, last.
+    spec = km.kernel_spec
+    spec.env = {**(spec.env or {}), **{k: os.environ[k] for k in ISOLATION if k in os.environ}}
     kc = None
     t0 = time.monotonic()
     try:
         try:
-            km.start_kernel()
+            km.start_kernel(cwd=os.environ.get("JUPYTER_RUNTIME_DIR") or None)
             pid = getattr(getattr(km, "provisioner", None), "pid", None) or getattr(getattr(km, "kernel", None), "pid", None)
             if pid:
                 with open(pidfile, "w") as f:
@@ -100,13 +112,20 @@ def main():
         t1 = time.monotonic()
         try:
             reply = kc.execute_interactive(
-                "import torch; print(torch.__version__)", timeout=RUN, output_hook=hook, store_history=False, allow_stdin=False
+                "import os, sys, torch; print(torch.__version__); print(os.path.realpath(sys.prefix))",
+                timeout=RUN,
+                output_hook=hook,
+                store_history=False,
+                allow_stdin=False,
             )
             c = reply.get("content", {})
+            said = "".join(out).split()
             if c.get("status") == "ok":
                 kv("torch", "ok")
-                kv("torch_version", "".join(out).strip() or "?")
+                kv("torch_version", said[0] if said else "?")
                 kv("torch_secs", f"{time.monotonic() - t1:.1f}")
+                if len(said) > 1 and said[1] != prefix:
+                    kv("prefix", said[1])
             else:
                 kv("torch", f"error: {c.get('ename', '?')}: {c.get('evalue', '')}")
         except TimeoutError:

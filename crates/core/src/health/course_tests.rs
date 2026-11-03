@@ -77,6 +77,8 @@ fn the_course_facts_parse_and_unknowns_stay_unknown() {
     let c = f.claude.unwrap();
     assert_eq!((c.fingerprint, c.http), (None, None));
     assert_eq!(f.repo.unwrap().branch, None);
+    // `~/.name` as setup writes it: the name.
+    assert_eq!(facts("id.name=export MACHINE_NAME=\"devtest-apple\"\n").identity.unwrap().name.as_deref(), Some("devtest-apple"));
     // An unknown course field is kept for --json, not dropped.
     assert_eq!(facts("repo.future=1\n").other.get("repo.future").map(String::as_str), Some("1"));
 }
@@ -149,7 +151,7 @@ fn proxy_verdicts() {
         (
             proxied(ProxyState::Live, Some(9500), Some(Err("connection refused".into())), true),
             Status::Warn,
-            "port 9500: connection refused (write-only proxy: nginx isn't reloaded here)".into(),
+            "port 9500: connection refused — write-only proxy here: SSH_PROXY_RELOAD_CMD reloads it".into(),
         ),
         (proxied(ProxyState::Live, Some(9500), None, false), Status::Skip, "port 9500 not tried".into()),
     ];
@@ -189,6 +191,12 @@ fn backup_verdicts() {
         (facts(&with("repo.state", "repo.state=missing")), book(), Status::Skip, "needs the course repo (see repo)".into()),
         (facts(&with("push.key", "push.key=missing")), book(), Status::Fail, format!("no deploy key on it (GIT_SSH_KEY_REMOTE) — {setup}")),
         (
+            facts(&with("push.exit", "").replace("push.key=set", "push.key=none")),
+            book(),
+            Status::Warn,
+            "push not checked: no cohort repo to push to — set ARENA_REPO_OWNER and ARENA_REPO_NAME".into(),
+        ),
+        (
             push("128", "ERROR: The key you are authenticating with has been marked as read only."),
             book(),
             Status::Fail,
@@ -224,7 +232,7 @@ fn backup_verdicts() {
             ok.clone(),
             CourseBook { backups: Some(Err("backups.json: Permission denied".into())), ..book() },
             Status::Warn,
-            "pushes; the backups' record can't be read: backups.json: Permission denied".into(),
+            "pushes; the backups' record can't be read: backups.json: Permission denied — `arena backups`".into(),
         ),
         (facts(""), book(), Status::Skip, NOT_REPORTED.into()),
     ];
@@ -243,7 +251,7 @@ fn repo_verdicts() {
             facts(&with("repo.state", "repo.state=error: fatal: detected dubious ownership in repository at '/root/ARENA_materials'")),
             book(),
             Status::Warn,
-            "can't read /root/ARENA_materials: fatal: detected dubious ownership in repository at '/root/A…".into(),
+            "can't read /root/ARENA_materials: fatal: detected dubious ownership in re… — `arena pods ask apple`".into(),
         ),
         (
             facts(&with("repo.origin_keys", "repo.origin_keys=github.com/arena-education/arena_materials").replace("repo.origin=github.com:nickypro", "repo.origin=github.com:ARENA-education")),
@@ -379,7 +387,7 @@ fn claude_verdicts() {
             claude_lines("claude.auth_error=no python3 to read Claude Code's settings\n"),
             book(),
             Status::Warn,
-            "v2.1.30; its auth couldn't be read: no python3 to read Claude Code's settin…".into(),
+            "v2.1.30; its auth couldn't be read: no python3 to read Claude C… — `arena pods setup apple`".into(),
         ),
     ];
     for (f, b, status, detail) in cases {
@@ -424,6 +432,13 @@ fn kernel_verdicts() {
             facts(&with("kernel.ipykernel", "").replace("kernel.specs=arena-env,python3\n", "")),
             Status::Warn,
             "not checked: the kernel check didn't report — `arena pods test --course apple`".into(),
+        ),
+        // A spec that runs another env's python (two venvs on one interpreter): its torch isn't the
+        // course env's.
+        (
+            k("kernel.done", "kernel.prefix=/root/other-venv"),
+            Status::Warn,
+            format!("{register} (the arena-env kernel runs /root/other-venv, not /opt/arena-env)"),
         ),
         (facts(&good_lines()), Status::Pass, "arena-env: torch 2.9.0+cu130 in 4.3s".into()),
     ];
@@ -478,6 +493,15 @@ fn every_verdict_fits_the_notes_cell() {
         ("kernel.torch", "kernel.torch=timed out after 25s"),
         ("kernel.registered", "kernel.registered=none"),
         ("uv.path", "uv.path=missing"),
+        ("push.key", "push.key=none"),
+        ("repo.state", "repo.state=error: fatal: not a git repository (or any of the parent directories): .git"),
+        ("claude.auth", "claude.auth_error=no python3 to read Claude Code's settings"),
+        ("kernel.specs", "kernel.specs=error: PermissionError: [Errno 13] Permission denied: '/usr/local/share/jupyter/kernels'"),
+        ("kernel.done", "kernel.prefix=/root/somewhere/else/entirely/.venv"),
+        ("claude.auth", "claude.auth=oauth\nclaude.source=shell\nclaude.call=messages\nclaude.http=429"),
+        ("claude.auth", "claude.auth=api_key\nclaude.call=messages\nclaude.http=429"),
+        ("claude.auth", "claude.auth=bearer\nclaude.base_host=gateway.example\nclaude.call=messages\nclaude.http=502\nclaude.error=Bad gateway"),
+        ("claude.auth", "claude.auth=none"),
     ] {
         lines.push(with(k, v).replace("/opt/arena-env", "/root/ARENA_materials/.venv"));
     }
@@ -496,6 +520,15 @@ fn every_verdict_fits_the_notes_cell() {
         backups: Some(Ok([(long.to_string(), cell(BackupHealth::Fail, "failed", Some(60), Some("BIGSTUCK 120000000 checkpoints/model.safetensors")))].into_iter().collect())),
         ..book()
     });
+    books.push(CourseBook {
+        backups: Some(Ok([(long.to_string(), cell(BackupHealth::Warn, "pushed", Some(9000), Some("not backed up for 2 h 30 min (due every 15 min)")))].into_iter().collect())),
+        ..book()
+    });
+    books.push(CourseBook { backups: Some(Err("/home/dev/.local/state/arena/devtest/backups.json: Permission denied".into())), ..book() });
+    let write_only = [(format!("runpod:id-{long}"), Port { port: Some(65000), state: ProxyState::Live, reached: Some(Err("connection refused".into())) })];
+    books.push(CourseBook { proxy: Some(ProxyBook { write_only: true, ports: write_only.into_iter().collect() }), ..book() });
+    let pushed = [(format!("runpod:id-{long}"), (Some("someone.with.a.long.address@arena.education".to_string()), Some("000000000000".to_string())))];
+    books.push(CourseBook { claude: ClaudeBook { pushed: pushed.into_iter().collect(), pool: Default::default() }, ..book() });
     let mut bad = std::collections::BTreeSet::new();
     for l in &lines {
         for b in &books {
@@ -503,6 +536,10 @@ fn every_verdict_fits_the_notes_cell() {
                 let cell = format!("{}: {}", c.name, c.detail);
                 if !command_fits(&cell) {
                     bad.insert(format!("{} chars: {cell}", cell.chars().count()));
+                }
+                // Every FAIL and WARN says what to run (or do): after its dash, or first.
+                if matches!(c.status, Status::Fail | Status::Warn) && !(c.detail.contains(" — ") || c.detail.starts_with('`')) {
+                    bad.insert(format!("no remedy: {cell}"));
                 }
             }
         }
@@ -552,6 +589,7 @@ fn the_course_report_has_a_cell_each() {
 
 #[test]
 fn the_identity_command_reads_back_through_the_parser() {
+    assert!(!IDENTITY_SH.contains('\''), "it goes inside single quotes");
     if !std::path::Path::new("/bin/sh").exists() {
         return;
     }
@@ -649,11 +687,21 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
             let _ = write!(conn, "HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         }
     });
+    // The push goes to the cohort repo's SSH URL; here git sends that URL to the local bare repo
+    // (the machine's own config, as a participant's could say anything), so nothing leaves the box.
+    std::fs::write(home.join(".gitconfig"), format!("[url \"{}\"]\n\tinsteadOf = git@github.com:nickypro/arena-sandbox-materials.git\n", origin.display())).unwrap();
     let gitdir = repo.join(".git");
     std::fs::create_dir_all(gitdir.join("rebase-merge")).unwrap();
     let before = listing(&home);
+    let origin_before = listing(&origin);
     let tmp_before = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
-    let args = CheckArgs { repo: repo.display().to_string(), envs: vec!["~/nope".into(), env.display().to_string()], git_key: None, claude_call: false };
+    let args = CheckArgs {
+        repo: repo.display().to_string(),
+        envs: vec!["~/nope".into(), env.display().to_string()],
+        git_key: None,
+        claude_call: false,
+        origin: Some("nickypro/arena-sandbox-materials".into()),
+    };
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(crate::health::course_check_inner_command(&args))
@@ -671,6 +719,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
         .unwrap();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
     let after = listing(&home);
+    let origin_after = listing(&origin);
     let tmp_after = std::fs::read_dir("/tmp").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena_deep.")).count()).unwrap_or(0);
     let requests = seen.lock().unwrap().clone();
     let _ = std::fs::remove_dir_all(&root);
@@ -680,6 +729,7 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
         assert!(line.contains('='), "stray stdout line {line:?}");
     }
     assert_eq!(before, after, "the run changed something under $HOME:\n{stdout}");
+    assert_eq!(origin_before, origin_after, "the dry run sent something");
     assert!(tmp_after <= tmp_before, "a temp dir left behind");
     let f = parse_deep(&stdout);
     assert!(f.started && f.complete, "{stdout}\n{stderr}");
@@ -714,17 +764,102 @@ fn the_course_mode_reports_and_leaves_everything_as_it_was() {
 /// and the paid call's switch as its arguments, quoted.
 #[test]
 fn the_course_command_carries_its_arguments() {
-    let args = CheckArgs { repo: "/root/ARENA materials".into(), envs: vec!["/opt/arena-env".into(), "~/x".into()], git_key: Some("/root/.ssh/id".into()), claude_call: true };
+    let args = CheckArgs {
+        repo: "/root/ARENA materials".into(),
+        envs: vec!["/opt/arena-env".into(), "~/x".into()],
+        git_key: Some("/root/.ssh/id".into()),
+        claude_call: true,
+        origin: Some("nickypro/arena-sandbox-materials".into()),
+    };
     let cmd = crate::health::course_check_inner_command(&args);
-    assert!(cmd.ends_with(" arena-deep-check course '/root/ARENA materials' '/opt/arena-env:~/x' '/root/.ssh/id' 1 </dev/null"), "{cmd}");
+    assert!(
+        cmd.ends_with(" arena-deep-check course '/root/ARENA materials' '/opt/arena-env:~/x' '/root/.ssh/id' 1 'nickypro/arena-sandbox-materials' </dev/null"),
+        "{cmd}"
+    );
     assert!(crate::health::deep_check_inner_command_for(&args).contains(" arena-deep-check deep '/root/ARENA materials'"));
     let script = crate::health::deep_check_script();
     for mark in ["@ARENA_IDENTITY_SH@", "@ARENA_ORIGIN_SH@", "@ARENA_BUSY_OP_SH@", "@ARENA_CLAUDE_PY@", "@ARENA_KERNEL_PY@"] {
         assert!(!script.contains(mark), "{mark} left in the script");
     }
-    let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH=/root/ARENA_materials\nGIT_SSH_KEY_REMOTE=/root/.ssh/id_ed25519\n");
+    let cfg = Config::parse(
+        "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH=/root/ARENA_materials\nGIT_SSH_KEY_REMOTE=/root/.ssh/id_ed25519\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=n\n",
+    );
     let gpu = CheckArgs::for_pod(&cfg, &pod("devtest-apple"));
+    assert_eq!(gpu.origin.as_deref(), Some("o/n"));
     assert_eq!((gpu.repo.as_str(), gpu.git_key.as_deref(), gpu.envs.first().map(String::as_str)), ("/root/ARENA_materials", Some("/root/.ssh/id_ed25519"), Some("/opt/arena-env")));
     let vm = CheckArgs::for_pod(&cfg, &Pod { provider: "hetzner".into(), ..pod("devtest-apple") });
     assert_eq!(vm.envs.first().map(String::as_str), Some("/root/ARENA_materials/.venv"), "a bare VM's venv first");
+}
+
+/// The Claude helper scrubs a secret out of what a service says before anything is clipped: a
+/// gateway that echoes an opaque token (no `sk-` to match) from a settings file, past both clip
+/// points, prints none of it — and `--claude-call` asks Messages with an API key too.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_claude_helper_never_prints_an_echoed_secret() {
+    if !(have("bash") && have("python3") && have("base64") && have("timeout")) {
+        eprintln!("bash/python3/base64/timeout missing — skipping");
+        return;
+    }
+    const OPAQUE: &str = "OPAQUE-gateway-token-0123456789abcdefghijklmnopqrstuvwxyz";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut buf = [0u8; 8192];
+            let n = conn.read(&mut buf).unwrap_or(0);
+            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into());
+            // The first echo straddles the helper's 160-character clip, the second the script's 300.
+            let pad = "x".repeat(110);
+            let body = format!(r#"{{"error":{{"message":"{pad} bad token {OPAQUE} {pad} {OPAQUE}"}}}}"#);
+            let _ = write!(conn, "HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    let root = std::env::temp_dir().join(format!("arena-claude-scrub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, bin) = (root.join("home"), root.join("bin"));
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::remote::write_test_script(bin.join("claude"), "#!/bin/sh\necho '2.1.30 (Claude Code)'\n").unwrap();
+    std::fs::write(home.join(".claude/settings.json"), format!(r#"{{"env":{{"ANTHROPIC_AUTH_TOKEN":"{OPAQUE}","ANTHROPIC_BASE_URL":"{url}"}}}}"#)).unwrap();
+    let args = CheckArgs { repo: "/nonexistent".into(), envs: vec![], git_key: None, claude_call: true, origin: None };
+    let run = |extra: &[(&str, &str)]| {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(crate::health::course_check_inner_command(&args))
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+            .env("HOME", &home)
+            .env("no_proxy", "*")
+            .env("NO_PROXY", "*")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_BASE_URL");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
+    };
+    let out = run(&[]);
+    for piece in [OPAQUE, &OPAQUE[..20], &OPAQUE[OPAQUE.len() - 20..]] {
+        assert!(!out.contains(piece), "{piece} printed:\n{out}");
+    }
+    let c = parse_deep(&out).claude.unwrap();
+    assert_eq!((c.auth.as_deref(), c.source.as_deref(), c.call.as_deref(), c.http), (Some("bearer"), Some("settings"), Some("messages"), Some(401)), "{out}");
+    assert!(c.error.as_deref().is_some_and(|e| e.contains("[secret]")), "{out}");
+    // An API key with `--claude-call`: Messages, with its x-api-key.
+    std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
+    let out = run(&[("ANTHROPIC_API_KEY", "sk-ant-api03-PAID-CALL-TEST-0123456789"), ("ARENA_TEST_ANTHROPIC_URL", url.as_str())]);
+    let c = parse_deep(&out).claude.unwrap();
+    assert_eq!((c.auth.as_deref(), c.call.as_deref()), (Some("api_key"), Some("messages")), "{out}");
+    let requests = seen.lock().unwrap().clone();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(requests.iter().any(|r| r.starts_with("POST /v1/messages") && r.to_ascii_lowercase().contains("x-api-key: sk-ant-api03-paid-call-test")), "{requests:?}");
+    assert!(requests.iter().any(|r| r.starts_with("POST /v1/messages") && r.contains(&format!("Bearer {OPAQUE}"))), "{requests:?}");
 }

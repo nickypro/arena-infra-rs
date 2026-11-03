@@ -455,6 +455,21 @@ fn wandb_verdicts() {
         ),
         ("an old key that works", wb_lines("old-wandb-key", 200, "yes"), "devtest-apple", Warn, "works, but not the config's WANDB_API_KEY — `arena pods copy-keys apple`"),
         ("missing", "wandb.key=missing\n".into(), "devtest-apple", Fail, "missing — `arena pods copy-keys apple`"),
+        // A GraphQL error (HTTP 200 too), an empty answer: no user, so nothing said of the key.
+        (
+            "200 with no user",
+            wb_lines(WB_GOOD, 200, "unknown") + "wandb.error=permission denied\n",
+            "devtest-apple",
+            Warn,
+            "not checked (no user in W&B's answer: permission denied) — `arena pods test --keys apple`",
+        ),
+        (
+            "200 from an older script, no viewer said",
+            format!("wandb.key=set\nwandb.fingerprint={}\nwandb.curl_exit=0\nwandb.http=200\n", fingerprint(WB_GOOD)),
+            "devtest-apple",
+            Warn,
+            "not checked (no user in W&B's answer: ?) — `arena pods test --keys apple`",
+        ),
         (
             "unreachable",
             "wandb.key=set\nwandb.curl_exit=6\nwandb.http=000\nwandb.error=curl: (6) Could not resolve host: api.wandb.ai\n".into(),

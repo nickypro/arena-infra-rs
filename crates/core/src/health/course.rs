@@ -54,19 +54,22 @@ pub fn is_course_check(name: &str) -> bool {
 }
 
 /// The machine's identity, printed by [`IDENTITY_SH`]: what it says through the proxy port is
-/// held to what it says directly.
+/// held to what it says directly. The same text runs in the check script (bash) and through the
+/// port (the participant's login shell, whatever its locale): POSIX only, the sort in the C locale,
+/// no single quotes (it goes inside them).
 pub const IDENTITY_SH: &str = r#"arena_identity() {
   arena_n=$(head -n 1 "$HOME/.name" 2>/dev/null | tr -d "\r")
   printf "id.name=%s\n" "${arena_n:-none}"
   printf "id.hostname=%s\n" "$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null)"
-  arena_k=$(cat /etc/ssh/ssh_host_*_key.pub 2>/dev/null | sort | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null; } | cut -c1-12)
+  arena_k=$(cat /etc/ssh/ssh_host_*_key.pub 2>/dev/null | LC_ALL=C sort | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null; } | cut -c1-12)
   printf "id.hostkey=%s\n" "${arena_k:-unknown}"
 }"#;
 
 /// The command the proxy check runs through a machine's proxy port: its identity
-/// ([`IDENTITY_SH`]) between the deep check's header and trailer, so [`super::parse_deep`] reads it.
+/// ([`IDENTITY_SH`]) between the deep check's header and trailer, so [`super::parse_deep`] reads it
+/// — under `sh`, whatever the login shell (zsh's failed globs abort a command).
 pub fn identity_command() -> String {
-    format!("echo deep_check=3; {IDENTITY_SH}; arena_identity; echo deep_check_end=1")
+    format!("sh -c '{IDENTITY_SH}\necho deep_check=3; arena_identity; echo deep_check_end=1'")
 }
 
 /// How long the proxy check's connection through a port may take: an ssh connect and a few
@@ -89,6 +92,9 @@ pub struct CheckArgs {
     pub git_key: Option<String>,
     /// `pods test --claude-call`: one tiny Claude request per machine, on its account.
     pub claude_call: bool,
+    /// The cohort repo (`owner/name`, [`crate::backup::configured_repo`]): the dry-run push goes
+    /// to its SSH URL, never to origin's (which could carry a credential). `None`: no push tried.
+    pub origin: Option<String>,
 }
 
 impl CheckArgs {
@@ -98,18 +104,19 @@ impl CheckArgs {
         let bare = crate::setup::bare_vm(&pod.provider).is_some();
         let envs = crate::agent_notes::env_candidates(cfg.get("CONDA_ENV").filter(|e| !e.is_empty()).unwrap_or("arena-env"), &repo, bare);
         let git_key = cfg.get("GIT_SSH_KEY_REMOTE").map(str::trim).filter(|k| !k.is_empty()).map(String::from);
-        Self { repo, envs, git_key, claude_call: false }
+        Self { repo, envs, git_key, claude_call: false, origin: crate::backup::configured_repo(cfg) }
     }
 
     /// The script's arguments after its mode, shell-quoted.
     pub(super) fn words(&self) -> String {
         let q = crate::setup::shell_quote;
         format!(
-            " {} {} {} {}",
+            " {} {} {} {} {}",
             q(&self.repo),
             q(&self.envs.join(":")),
             q(self.git_key.as_deref().unwrap_or("")),
-            if self.claude_call { "1" } else { "0" }
+            if self.claude_call { "1" } else { "0" },
+            q(self.origin.as_deref().unwrap_or(""))
         )
     }
 }
@@ -165,7 +172,8 @@ pub struct RepoFacts {
 /// `push.*`: the dry-run push with the deploy key.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PushFacts {
-    /// `set` (the configured key), `default` (none configured: ssh's own), `missing`.
+    /// `set` (the configured key), `default` (none configured: ssh's own), `missing`, `none` (no
+    /// cohort repo configured to push to: not tried).
     pub key: Option<String>,
     pub exit: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +248,10 @@ pub struct KernelFacts {
     pub torch_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub torch_secs: Option<f64>,
+    /// The env the kernel actually runs (`sys.prefix`), when it isn't the course env: a spec
+    /// pointing elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     /// The helper itself failed or timed out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -265,7 +277,12 @@ pub(super) fn course_fact(f: &mut DeepFacts, key: &str, value: &str) -> bool {
         "id" => {
             let id = f.identity.get_or_insert_with(Identity::default);
             match field {
-                "name" => id.name = text().filter(|v| v != "none"),
+                // setup writes it as `export MACHINE_NAME=devtest-apple`: the name is the news.
+                "name" => {
+                    let bare = value.strip_prefix("export ").unwrap_or(value);
+                    let bare = bare.strip_prefix("MACHINE_NAME=").unwrap_or(bare).trim_matches(['"', '\'']);
+                    id.name = Some(bare.to_string()).filter(|v| !v.is_empty() && v != "none" && v != "unknown");
+                }
                 "hostname" => id.hostname = text(),
                 "hostkey" => id.hostkey = text().filter(|v| v.len() == 12 && v.bytes().all(|b| b.is_ascii_hexdigit())),
                 _ => return false,
@@ -333,6 +350,7 @@ pub(super) fn course_fact(f: &mut DeepFacts, key: &str, value: &str) -> bool {
                 "torch" => k.torch = text(),
                 "torch_version" => k.torch_version = text(),
                 "torch_secs" => k.torch_secs = num(),
+                "prefix" => k.prefix = text(),
                 "error" => k.error = text(),
                 "done" | "jupyter_client" => {}
                 _ => return false,
@@ -623,7 +641,7 @@ fn proxy_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
             None => Check::new(name, Warn, format!("port {n} answers; not compared (no identity reported) — `arena pods test --deep {}`", book.short(&pod.name))),
         },
         Some(Err(why)) if px.write_only => {
-            Check::new(name, Warn, format!("port {n}: {} (write-only proxy: nginx isn't reloaded here)", clip_why(why, 40)))
+            Check::new(name, Warn, format!("port {n}: {} — write-only proxy here: SSH_PROXY_RELOAD_CMD reloads it", clip_why(why, 40)))
         }
         Some(Err(why)) if stale => Check::new(name, Fail, format!("port {n} forwards to an old endpoint ({}) — {apply}", clip_why(why, 30))),
         Some(Err(why)) => Check::new(name, Fail, format!("port {n} doesn't reach it: {} — {apply}", clip_why(why, 40))),
@@ -651,6 +669,9 @@ fn backup_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     if p.key.as_deref() == Some("missing") {
         return Check::new(name, Fail, format!("no deploy key on it (GIT_SSH_KEY_REMOTE) — `arena pods setup {s}`"));
     }
+    if p.key.as_deref() == Some("none") {
+        return Check::new(name, Warn, "push not checked: no cohort repo to push to — set ARENA_REPO_OWNER and ARENA_REPO_NAME");
+    }
     if p.exit != Some(0) {
         let why = p.error.clone().unwrap_or_else(|| format!("git push exit {}", p.exit.map_or("?".into(), |e| e.to_string())));
         let e = why.to_ascii_lowercase();
@@ -666,7 +687,7 @@ fn backup_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     }
     let cell = match book.backups.as_ref() {
         None => None,
-        Some(Err(why)) => return Check::new(name, Warn, format!("pushes; the backups' record can't be read: {}", clip_why(why, 48))),
+        Some(Err(why)) => return Check::new(name, Warn, format!("pushes; the backups' record can't be read: {} — `arena backups`", clip_why(why, 40))),
         Some(Ok(cells)) => cells.get(&pod.name),
     };
     let ago = |t: u64| crate::backups::ago(book.now, t);
@@ -701,7 +722,9 @@ fn repo_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     match r.state.as_deref() {
         Some("ok") => {}
         Some("missing") => return Check::new(name, Fail, format!("no course repo at {path} — `arena pods setup {s}`")),
-        Some(e) => return Check::new(name, Warn, format!("can't read {path}: {}", clip_why(e.strip_prefix("error: ").unwrap_or(e), 60))),
+        Some(e) => {
+            return Check::new(name, Warn, format!("can't read {path}: {} — `arena pods ask {s}`", clip_why(e.strip_prefix("error: ").unwrap_or(e), 40)))
+        }
         None => unreachable!(),
     }
     if let Some(want) = book.origin.as_deref() {
@@ -779,7 +802,10 @@ fn claude_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     let pool_account = c.fingerprint.as_ref().and_then(|f| book.claude.pool.get(f));
     // Which auth, in words.
     let what = match c.auth.as_deref() {
-        None => return Check::new(name, Warn, format!("v{v}; its auth couldn't be read: {}", clip_why(c.auth_error.as_deref().unwrap_or("?"), 40))),
+        None => {
+            let why = clip_why(c.auth_error.as_deref().unwrap_or("?"), 28);
+            return Check::new(name, Warn, format!("v{v}; its auth couldn't be read: {why} — `arena pods setup {s}`"));
+        }
         Some("none") => {
             return match pushed {
                 Some((Some(acct), _)) => Check::new(name, Warn, format!("v{v}: no token, though arena claude pushed one — {push} ({acct})")),
@@ -873,7 +899,9 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
     let register = run(format!("{env}/bin/python -m ipykernel install --user"));
     match k.specs.as_deref() {
         Some("none") => return Check::new(name, Warn, format!("{register} (no Jupyter kernel runs {env})")),
-        Some(e) if e.starts_with("error") => return Check::new(name, Warn, format!("its kernels can't be listed: {}", clip_why(e, 48))),
+        Some(e) if e.starts_with("error") => {
+            return Check::new(name, Warn, format!("its kernels can't be listed: {} — `arena pods setup {s}`", clip_why(e, 40)))
+        }
         _ => {}
     }
     let kname = k.name.as_deref().unwrap_or("?");
@@ -899,6 +927,10 @@ fn kernel_check(f: &DeepFacts, pod: &Pod, book: &CourseBook) -> Check {
         }
     }
     let torch = k.torch_version.as_deref().unwrap_or("?");
+    // The kernel picked runs another env (its spec points there): a pass would be that env's.
+    if let Some(other) = &k.prefix {
+        return Check::new(name, Warn, format!("{register} (the {kname} kernel runs {other}, not {env})"));
+    }
     if k.registered.as_deref().is_none_or(|r| r == "none") {
         return Check::new(name, Warn, format!("{register} (works, torch {torch}, but no kernel is registered for {env})"));
     }

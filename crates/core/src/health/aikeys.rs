@@ -566,6 +566,11 @@ fn token_check(t: &Token, k: Option<&KeyFacts>, pod: &Pod, book: &KeyBook) -> Ch
             None => format!("unreachable: {}", short_why(&k.unreached())),
         });
     }
+    // W&B answers 200 to anything: only a user in its answer says the key works (a GraphQL error,
+    // an empty answer says nothing of it).
+    if name == WANDB_CHECK && k.viewer != Some(true) {
+        return unchecked(format!("no user in W&B's answer: {}", short_why(k.error.as_deref().unwrap_or("?"))));
+    }
     if stale {
         Check::new(name, Warn, format!("works, but {old} — {copy}"))
     } else if let (true, Some(e)) = (uncompared, unreadable) {

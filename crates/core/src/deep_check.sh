@@ -4,8 +4,9 @@
 # facts, in a few seconds) or `course` (`pods test --course`: what a participant uses beside the
 # machine, no GPU work). Then, for the course facts (`deep` and `course` only; without them none
 # are gathered): the course repo's path, the course env's candidates (`:`-separated, most likely
-# first), the deploy key's path (`GIT_SSH_KEY_REMOTE`, may be empty) and `1` to make the one Claude
-# call that uses the machine's account (`pods test --claude-call`; else `0`).
+# first), the deploy key's path (`GIT_SSH_KEY_REMOTE`, may be empty), `1` to make the one Claude
+# call that uses the machine's account (`pods test --claude-call`; else `0`), and the cohort repo
+# (`owner/name`, may be empty) the dry-run push goes to.
 #
 # Contract with the parser (arena_core::health::parse_deep):
 #   * stdout carries ONLY `key=value` lines: one fact per line, single-line values. The
@@ -16,8 +17,9 @@
 #   * every sub-step is bounded with `timeout` and the network probe runs alongside the
 #     GPU checks, so a run ends in under ~2 minutes even on a sick host (worst case ≈
 #     10+10+10 nvidia-smi, 5 driver file, 75 python, 5+5 df; the caller's budget is
-#     DEEP_CHECK_TIMEOUT). The keys' calls run alongside too (15s each), and so do the course
-#     probes: the dry-run push (20s), Claude Code (10s + 15s) and the notebook kernel (50s).
+#     DEEP_CHECK_TIMEOUT). The keys' calls run alongside too (15s each), and so do all of the
+#     course's probes, from the start: the repo's metadata and the dry-run push (25s + 20s),
+#     Claude Code (10s + 25s), the notebook kernel (50s), uv (5s).
 #   * no secret is ever printed: a key or token is reported by its fingerprint only.
 # Read-only apart from its own temp dir (removed on exit): the course repo's git metadata is read
 # (never its files, never its index written), the push is a dry run, the kernel runs with its
@@ -36,6 +38,7 @@ course_repo=${2:-}
 course_envs=${3:-}
 course_key=${4:-}
 claude_call=${5:-0}
+course_origin=${6:-}
 
 echo "deep_check=3"
 
@@ -231,6 +234,11 @@ keys_report() {
       kv wandb.viewer no
     elif [ -n "$(json_value id "$work/wandb.body")" ]; then
       kv wandb.viewer yes
+    else
+      # Neither: a GraphQL error (HTTP 200 too), an empty answer — not a verdict on the key.
+      kv wandb.viewer unknown
+      v=$(json_value message "$work/wandb.body")
+      kv wandb.error "$(scrub "${v:-no viewer in the answer}")"
     fi
   fi
 }
@@ -246,7 +254,6 @@ keys_report() {
 # @ARENA_BUSY_OP_SH@
 export GIT_OPTIONAL_LOCKS=0
 ANTHROPIC_URL=${ARENA_TEST_ANTHROPIC_URL:-https://api.anthropic.com}
-repo_state="" repo_branch="" repo_detached="" repo_op="" repo_urls=""
 course_pids=""
 
 # `in_repo git …`: a git command in the course repo, bounded (fsmonitor hooks off: none runs).
@@ -254,60 +261,91 @@ in_repo() {
   (cd "$course_repo" 2>/dev/null && bounded 5 git -c core.fsmonitor=false "$@")
 }
 
-course_repo_facts() {
-  local gd
-  if [ ! -e "$course_repo" ]; then
-    repo_state=missing
-    return
-  fi
-  if ! have git; then
-    repo_state="error: no git on PATH"
-    return
-  fi
-  if ! gd=$(in_repo rev-parse --absolute-git-dir 2>"$work/git.err"); then
-    repo_state="error: $(first_line "$(cat "$work/git.err" 2>/dev/null)")"
-    return
-  fi
-  repo_state=ok
-  repo_branch=$(in_repo symbolic-ref -q --short HEAD 2>/dev/null)
-  [ -n "$repo_branch" ] || repo_detached=$(in_repo rev-parse --short HEAD 2>/dev/null)
-  repo_op=$(cd "$course_repo" 2>/dev/null && busy_op "$gd" 2>/dev/null | head -n 1)
-  repo_urls=$({ in_repo remote get-url --all origin; in_repo remote get-url --push --all origin; } 2>/dev/null)
+# The repo's metadata, then the dry-run push, in one background job (git can be slow on a big
+# checkout or a network-mounted one): `repo.*` lines into $work/repo.facts, and the push's files.
+repo_job() {
+  local gd branch op urls u keys=""
+  {
+    printf 'repo.path=%s\n' "$course_repo"
+    if [ ! -e "$course_repo" ]; then
+      echo "repo.state=missing"
+      return 0
+    fi
+    if ! have git; then
+      echo "repo.state=error: no git on PATH"
+      return 0
+    fi
+    if ! gd=$(in_repo rev-parse --absolute-git-dir 2>"$work/git.err"); then
+      printf 'repo.state=error: %s\n' "$(first_line "$(cat "$work/git.err" 2>/dev/null)")"
+      return 0
+    fi
+    echo "repo.state=ok"
+    branch=$(in_repo symbolic-ref -q --short HEAD 2>/dev/null)
+    if [ -n "$branch" ]; then
+      printf 'repo.branch=%s\n' "$branch"
+    else
+      printf 'repo.detached=%s\n' "$(in_repo rev-parse --short HEAD 2>/dev/null)"
+    fi
+    op=$(cd "$course_repo" 2>/dev/null && busy_op "$gd" 2>/dev/null | head -n 1)
+    printf 'repo.op=%s\n' "${op:-none}"
+    urls=$({ in_repo remote get-url --all origin; in_repo remote get-url --push --all origin; } 2>/dev/null)
+    u=$(first_line "$urls")
+    printf 'repo.origin=%s\n' "$(origin_shown "${u:-}")"
+    while IFS= read -r u; do
+      [ -z "$u" ] || keys="$keys $(origin_key "$u")"
+    done <<URLS
+$urls
+URLS
+    printf 'repo.origin_keys=%s\n' "$(trim "$keys")"
+    printf '%s' "$branch" >"$work/repo.branch"
+    : >"$work/repo.ok"
+  } >"$work/repo.facts"
+  push_probe
 }
 
-# A dry run of the push the backup makes, with its deploy key: GitHub answers a push for the key
-# (a read-only key, or one not on the repo, is refused here) and nothing is sent. No hook runs
-# (`--no-verify`, no hooks path), and a host key ssh hasn't seen goes into the temp dir's
-# known-hosts file, never the machine's.
-push_start() {
-  local key=$course_key ref
-  [ "$repo_state" = ok ] || return 0
+# A dry run of the push the backup makes, with its deploy key, to the cohort repo's SSH URL —
+# never origin's own URL, which could carry a credential to a command line or a credential
+# helper: GitHub answers a push for the key (a read-only key, or one not on the repo, is refused)
+# and nothing is sent. No hook runs (`--no-verify`, no hooks path), no credential helper, and a
+# host key ssh hasn't seen goes into the temp dir's known-hosts file, never the machine's.
+push_probe() {
+  local key=$course_key ref s
+  [ -e "$work/repo.ok" ] || return 0
+  if [ -z "$course_origin" ]; then
+    echo none >"$work/push.key"
+    return 0
+  fi
   case $key in "~/"*) key=$HOME/${key#"~/"} ;; esac
   if [ -n "$key" ] && [ ! -r "$key" ]; then
     echo missing >"$work/push.key"
     return 0
   fi
-  ref=${repo_branch:-arena-push-check}
+  ref=$(cat "$work/repo.branch" 2>/dev/null)
+  s="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  s="$s -o 'UserKnownHostsFile=$work/known_hosts $HOME/.ssh/known_hosts'"
+  [ -z "$key" ] || s="$s -i '$key' -o IdentitiesOnly=yes"
   (
-    s="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-    s="$s -o 'UserKnownHostsFile=$work/known_hosts $HOME/.ssh/known_hosts'"
-    [ -z "$key" ] || s="$s -i '$key' -o IdentitiesOnly=yes"
-    export GIT_SSH_COMMAND="$s"
     cd "$course_repo" &&
-      bounded 20 git -c core.hooksPath=/dev/null -c core.fsmonitor=false push --dry-run --no-verify --porcelain \
-        origin "HEAD:refs/heads/$ref" >"$work/push.out" 2>"$work/push.err"
+      GIT_SSH_COMMAND=$s GIT_TERMINAL_PROMPT=0 bounded 20 git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        -c credential.helper= push --dry-run --no-verify --porcelain "git@github.com:$course_origin.git" \
+        "HEAD:refs/heads/${ref:-arena-push-check}" >"$work/push.out" 2>"$work/push.err"
     echo "$?" >"$work/push.rc"
-  ) </dev/null &
-  course_pids="$course_pids $!"
+  )
 }
 
 push_report() {
   local rc msg
-  [ "$repo_state" = ok ] || return 0
-  if [ "$(cat "$work/push.key" 2>/dev/null)" = missing ]; then
-    kv push.key missing
-    return 0
-  fi
+  [ -e "$work/repo.ok" ] || return 0
+  case $(cat "$work/push.key" 2>/dev/null) in
+    missing)
+      kv push.key missing
+      return 0
+      ;;
+    none)
+      kv push.key none
+      return 0
+      ;;
+  esac
   kv push.key "$([ -n "$course_key" ] && echo set || echo default)"
   rc=$(cat "$work/push.rc" 2>/dev/null)
   kv push.exit "${rc:-unknown}"
@@ -418,41 +456,38 @@ kernel_report() {
   esac
 }
 
+# Every course probe starts here, in the background, alongside the machine's checks.
 course_start() {
   [ "$course" = 1 ] || return 0
-  course_repo_facts
-  push_start
+  (repo_job) </dev/null &
+  course_pids="$course_pids $!"
   claude_start
   kernel_start
+  (
+    u=$(command -v uv 2>/dev/null)
+    printf 'uv.path=%s\n' "${u:-missing}"
+    [ -z "$u" ] || printf 'uv.version=%s\n' "$(first_line "$(bounded 5 uv --version 2>/dev/null)")"
+  ) </dev/null >"$work/uv.facts" &
+  course_pids="$course_pids $!"
 }
 
 course_report() {
-  local p u keys=""
+  local p
   [ "$course" = 1 ] || return 0
   arena_identity
-  kv repo.path "$course_repo"
-  kv repo.state "$repo_state"
-  if [ "$repo_state" = ok ]; then
-    if [ -n "$repo_branch" ]; then kv repo.branch "$repo_branch"; else kv repo.detached "${repo_detached:-unknown}"; fi
-    kv repo.op "${repo_op:-none}"
-    u=$(first_line "$repo_urls")
-    kv repo.origin "$(origin_shown "${u:-}")"
-    while IFS= read -r u; do
-      [ -z "$u" ] || keys="$keys $(origin_key "$u")"
-    done <<URLS
-$repo_urls
-URLS
-    kv repo.origin_keys "$(trim "$keys")"
-  fi
   for p in $course_pids; do
     wait "$p" 2>/dev/null
   done
+  if [ -s "$work/repo.facts" ]; then
+    pass_facts "$work/repo.facts" repo
+  else
+    kv repo.path "$course_repo"
+    kv repo.state "error: the repo check didn't finish"
+  fi
   push_report
   claude_report
   kernel_report
-  u=$(command -v uv 2>/dev/null)
-  kv uv.path "${u:-missing}"
-  [ -z "$u" ] || kv uv.version "$(first_line "$(bounded 5 uv --version 2>/dev/null)")"
+  [ ! -s "$work/uv.facts" ] || pass_facts "$work/uv.facts" uv
 }
 
 if [ "$mode" = keys ]; then
