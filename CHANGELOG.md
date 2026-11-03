@@ -19,7 +19,7 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-11-03 · `set-branch`: an interrupted switch never strands a participant's key
+## 2026-11-03 · arena 2.19: `set-branch`: an interrupted switch never strands a participant's key; `pods clean-kept`
 - A branch switch sets aside the real keys in files the backup committed redacted, and puts them
   back after the switch, or when it's stopped. If it was stopped just after it set a file aside
   (its time limit on the pod, a dropped connection), the file was left with the redacted
