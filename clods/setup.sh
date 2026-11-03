@@ -206,6 +206,13 @@ def done():
         print("changed")
     sys.exit(0)
 
+# What an install cut short left (save's temp files, a token in them): never kept. Under the
+# install lock, so none is another install's file in the making.
+for name in os.listdir(profile):
+    if name.startswith((".settings.json.", ".claude.json.")):
+        os.unlink(os.path.join(profile, name))
+        changed = True
+
 path = os.path.join(profile, "settings.json")
 settings = load(path)
 if not token:
@@ -219,17 +226,21 @@ if not token:
     done()
 
 # A new profile starts from this machine's normal settings (theme, permission prefs...), but not
-# their credentials: an API key, a gateway's token or address, a key helper or a cloud provider
-# there would beat the profile's own token (Claude Code's order), and every profile would use it.
-OTHER_AUTH = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]
+# their credentials: an API key, a gateway (its token, address or headers), a key helper or a
+# cloud provider's settings there would beat the profile's own token (Claude Code's order) or go
+# with every request, on every profile. So no ANTHROPIC_* (but the models), and no cloud's.
+def other_auth(k):
+    if k.startswith("ANTHROPIC_"):
+        return "MODEL" not in k
+    return k.startswith(("AWS_", "GOOGLE_", "AZURE_", "CLOUD_ML_", "VERTEX_", "CLAUDE_CODE_USE_", "CLAUDE_CODE_SKIP_"))
+
 new = settings is None
 if new:
     settings = load(os.path.join(home, ".claude", "settings.json")) or {}
-    settings.pop("apiKeyHelper", None)
+    for k in ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"):
+        settings.pop(k, None)
     if isinstance(settings.get("env"), dict):
-        for k in OTHER_AUTH:
-            settings["env"].pop(k, None)
+        settings["env"] = {k: v for k, v in settings["env"].items() if not other_auth(k)}
 if not isinstance(settings.get("env"), dict):
     settings["env"] = {}
 env = settings["env"]

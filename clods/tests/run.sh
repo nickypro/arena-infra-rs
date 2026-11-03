@@ -60,17 +60,20 @@ EOF
   # arena pods cp|run [--yes] -t SEL ...: each pod in SEL (comma-separated) is hosts/POD.
   cat > "$T/bin/arena" <<EOF
 #!/usr/bin/env bash
+set -o pipefail
 printf '%s\n' "\$*" >> "$T/arena.log"
 [ "\$1" = pods ] || exit 2
 op=\$2; shift 2; sel=""
 while [ \$# -gt 0 ]; do case "\$1" in --yes) shift ;; -t) sel=\$2; shift 2 ;; *) break ;; esac; done
 [ -z "\${ARENA_FAIL:-}" ] || { echo "arena: \$ARENA_FAIL" >&2; exit 1; }
+rc=0
 for h in \${sel//,/ }; do
   case \$op in
-    cp) cp "\$1" "$T/hosts/\$h/\$2" ;;
-    run) HOME="$T/hosts/\$h" TMPDIR="$T/tmp" bash -c "\$1" 2>&1 | sed "s|^|[\$h] |" ;;
+    cp) cp "\$1" "$T/hosts/\$h/\$2" || rc=1 ;;
+    run) HOME="$T/hosts/\$h" TMPDIR="$T/tmp" bash -c "\$1" 2>&1 | sed "s|^|[\$h] |" || rc=1 ;;
   esac
 done
+exit \$rc
 EOF
   chmod +x "$T/bin/"*
   export PATH="$T/bin:$PATH"
@@ -136,15 +139,17 @@ test_a_new_profile_takes_no_other_credential() {
   # and account 1's own token already there.
   mkdir -p "$HOME/.claude"
   cat > "$HOME/.claude/settings.json" <<'JSON'
-{"theme": "dark", "apiKeyHelper": "/bin/helper", "env": {"ANTHROPIC_API_KEY": "sk-ant-api03-FAKEkey",
- "ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://gw.example.com", "CLAUDE_CODE_USE_BEDROCK": "1",
+{"theme": "dark", "apiKeyHelper": "/bin/helper", "awsAuthRefresh": "aws sso login", "env": {
+ "ANTHROPIC_API_KEY": "sk-ant-api03-FAKEkey", "ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://gw.example.com",
+ "ANTHROPIC_CUSTOM_HEADERS": "Authorization: Bearer x", "ANTHROPIC_MODEL": "opus", "CLAUDE_CODE_USE_BEDROCK": "1",
+ "AWS_BEARER_TOKEN_BEDROCK": "x", "AWS_SECRET_ACCESS_KEY": "x", "GOOGLE_APPLICATION_CREDENTIALS": "/k.json",
  "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-FAKEaaaa", "DISABLE_TELEMETRY": "1"}}
 JSON
   out=$(bash "$T/clods/setup.sh" --summary "$T/clods/tokens")
   eq "$out" "clods: accounts=2 default=none changed=1"
   for n in 1 2; do
-    got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("theme"), d.get("apiKeyHelper"), sorted(d["env"]))' "$(P)/claude$n/settings.json")
-    eq "$got" "dark None ['CLAUDE_CODE_OAUTH_TOKEN', 'DISABLE_TELEMETRY']" "claude$n's settings"
+    got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("theme"), d.get("apiKeyHelper"), d.get("awsAuthRefresh"), sorted(d["env"]))' "$(P)/claude$n/settings.json")
+    eq "$got" "dark None None ['ANTHROPIC_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN', 'DISABLE_TELEMETRY']" "claude$n's settings"
   done
   eq "$(token_of "$(P)/claude1")" sk-ant-oat01-FAKEaaaa
 }
@@ -224,6 +229,9 @@ test_tokens_change() {
   bash "$T/clods/setup.sh" --default 2 "$T/clods/tokens" >/dev/null
   mkdir -p "$(P)/claude2/projects"; echo history > "$(P)/claude2/projects/s.jsonl"
   echo '{"claudeAiOauth": "a /login"}' > "$(P)/claude2/.credentials.json"
+  # What an install killed mid-write leaves: its temp file, the token in it.
+  echo '{"env": {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-FAKEbbbb"}}' > "$(P)/claude2/.settings.json.k2j4a9"
+  echo '{}' > "$(P)/claude1/.claude.json.zz81aa"
   # A rotated token, and an account added at the end.
   tokens "a@example.com -> sk-ant-oat01-FAKEnewa" "${FOUR[@]:1}" "e@example.com -> sk-ant-oat01-FAKEeeee"
   out=$(bash "$T/clods/setup.sh" --summary "$T/clods/tokens")
@@ -241,6 +249,8 @@ test_tokens_change() {
   eq "$(token_of "$(P)/claude2")" "" "the pruned token"
   gone "$(P)/claude2/.account"
   gone "$(P)/claude2/.credentials.json"
+  gone "$(P)/claude2/.settings.json.k2j4a9"
+  gone "$(P)/claude1/.claude.json.zz81aa"
   gone "$(P)/default"
   eq "$(cat "$(P)/claude2/projects/s.jsonl")" history "the pruned profile's history"
 }
@@ -349,6 +359,12 @@ test_push_arena() {
   eq "$(token_files "$T/hosts")" "" "token files outside the profiles"
   if ARENA_FAIL="pod not found" bash "$T/clods/push.sh" --arena -y -d 1 p1 > "$T/out" 2>&1; then fail "a failed arena push should fail"; fi
   has "$(cat "$T/out")" "✗ p1: failed"
+  # The copy goes, the installer fails on one pod of a group (its ~/.clods isn't a folder): the
+  # push fails, and the installer is removed there all the same.
+  rm -rf "$T/hosts/p3/.clods"; echo "not a folder" > "$T/hosts/p3/.clods"
+  if bash "$T/clods/push.sh" --arena -y -d 1 p2 p3 > "$T/out" 2>&1; then fail "an installer that failed should fail the push: $(cat "$T/out")"; fi
+  has "$(cat "$T/out")" "✗ p2,p3: failed"
+  eq "$(cd "$T/hosts" && find . -name '.claude-profiles-install*')" "" "installers left"
 }
 
 test_push_arena_at_once() {
@@ -368,6 +384,12 @@ test_push_arena_at_once() {
   done
   eq "$(cd "$T/hosts/p1" && find . -name '.claude-profiles-install*')" "" "installers left"
   eq "$(grep -o 'cp --yes -t p1 [^ ]* [^ ]*' "$T/arena.log" | awk '{print $NF}' | sort -u | wc -l)" 6 "distinct installer names"
+  # The last to finish set the pod's state: one tokens file's accounts or the other's, whole.
+  case "$(cd "$(HP p1)" && find . -name .account | sort | tr '\n' ' ')" in
+    "./claude1/.account ./claude2/.account "|"./claude1/.account ") ;;
+    *) fail "p1's profiles: $(cd "$(HP p1)" && find . -name .account)" ;;
+  esac
+  case "$(token_of "$(HP p1)/claude1")" in sk-ant-oat01-FAKEaaaa|sk-ant-oat01-FAKEcccc) ;; *) fail "p1's claude1 token" ;; esac
 }
 
 # ---- clods.sh, under bash and zsh -------------------------------------------------------------
