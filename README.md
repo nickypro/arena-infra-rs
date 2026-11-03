@@ -53,9 +53,10 @@ Pods up, SSH in, pods down: no proxy, no backups, no day branches. Install the l
   mv arena-$t arena; mv arena-tui-$t arena-tui; chmod +x arena arena-tui; rm sums; ./arena --version)
 ```
 
-Once it prints `arena <version>` (or [build it from source](#1-install)), make the key your pods
-will let in and a `config.env` to set the four keys below in (`config set` prompts, and never
-echoes the value):
+Once it prints `arena <version>`, make the key your pods will let in and a `config.env` to set
+the four keys below in (`config set` prompts, and never echoes the value). Built
+[from source](#1-install) instead? Copy `target/release/arena`, `target/release/arena-tui` and
+`config.env.example` into `~/arena` first.
 
 ```bash
 alias arena="$HOME/arena/arena --config $HOME/arena/config.env"
