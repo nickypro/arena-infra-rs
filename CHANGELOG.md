@@ -21,13 +21,14 @@ earlier).
 
 ## 2026-11-05 · the dashboard's add-pod form takes a pod name
 - The add-pod form (`n`) has a new last field, **name**. Type any name and the form makes one pod
-  with it (`arena pods up <name>`), with the prefix added as the CLI adds it. On that field, `←→`
-  steps through the list's free names. Delete the name to get the old behaviour back: the next
-  free names, as many as **pods** says.
+  with it (`arena pods up <name>`), with the prefix added as the CLI adds it. On an empty name
+  field, `←→` steps through the list's free names; a name you typed stays until you delete it.
+  Delete the name to get the old behaviour back: the next free names, as many as **pods** says.
 - On the name field, letters are typed, so `j`/`k` don't move; use the arrow keys.
-- A name that isn't on `MACHINE_NAME_LIST` is still made, but it gets no proxy port. The form and
-  its confirm say so. To give it one, add the name to the list. Add it at the end, because a
-  name's place in the list is its port.
+- A name that isn't on `MACHINE_NAME_LIST` is still made, and the git backup and the control
+  box's copy still include it. But it gets no proxy port, and the archive (backup copy #2) leaves
+  it out. The form and its confirm say so. To fix both, add the name to the list. Add it at the
+  end, because a name's place in the list is its port.
 - A name a pod already has (as of the last refresh) is refused, and the form stays open.
 
 ## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it

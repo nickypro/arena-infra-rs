@@ -217,6 +217,9 @@ pub(crate) const RETRY_EVERY_SECS: u64 = 60;
 /// The longest name the name field takes (before the prefix).
 pub(crate) const NAME_MAX: usize = 40;
 
+/// What a name off `MACHINE_NAME_LIST` goes without, as the form and its confirm say it.
+pub(crate) const OFF_LIST: &str = "not on MACHINE_NAME_LIST: made all the same, but no proxy port (ssh to its own endpoint) and no archive copy (the git backup and the control box's copy still run); add it to the list for both";
+
 /// The longest pod name, the prefix included: a hostname label's (Hetzner's server names).
 pub(crate) const LABEL_MAX: usize = 63;
 
@@ -363,9 +366,16 @@ impl NewPodForm {
     }
 
     /// `←→` on the name field: the next free name of the list in `delta`'s direction, past the
-    /// last back to none (the next free names); from a typed one, the first or the last.
+    /// last back to none (the next free names). A typed name that isn't one stays — ⌫ clears it
+    /// (review r2: `←`, reached for to edit, swapped it for a list name).
     fn pick_free(&mut self, delta: i32) {
-        let at = self.custom_name().and_then(|n| self.free.iter().position(|f| *f == n)).map_or(0, |i| i + 1);
+        let at = match self.custom_name() {
+            None => 0,
+            Some(n) => match self.free.iter().position(|f| *f == n) {
+                Some(i) => i + 1,
+                None => return,
+            },
+        };
         let i = wrap(at, delta, self.free.len() + 1);
         self.name = match i.checked_sub(1).and_then(|i| self.free.get(i)) {
             Some(n) => n.strip_prefix(&format!("{}-", self.prefix)).unwrap_or(n).to_string(),
@@ -400,7 +410,9 @@ impl NewPodForm {
     }
 
     /// The name is off `MACHINE_NAME_LIST`: `up` makes it all the same, but it gets no proxy port
-    /// (a name's place in the list is its port) — reached on its own endpoint.
+    /// (a name's place in the list is its port) and the archive leaves it out (its allowlist is
+    /// the list's names) — [`OFF_LIST`]. Prefixed, it's still the cohort's for the git backup and
+    /// the pull.
     pub(crate) fn off_list(&self) -> bool {
         self.custom_name().is_some_and(|n| !self.list.iter().any(|e| naming::qualify(&self.prefix, e) == n))
     }
@@ -882,15 +894,15 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
         }
         NpField::Name => {
             lines.push(Line::styled("the pod's name — typed (the prefix goes on), or a free one of MACHINE_NAME_LIST with ←→; ⌫ back to the next free:", label));
+            if !form.listed {
+                lines.push(Line::styled("  the fleet isn't listed yet: up checks the name against its own listing", dim));
+            }
             match form.custom_name() {
                 None => lines.push(Line::styled(format!("  next free: {}", form.planned_names().join(", ")), dim)),
                 Some(n) => {
                     let (text, tone) = match form.name_problem() {
                         Some(why) => (format!("  {why}"), Color::Red),
-                        None if form.off_list() => (
-                            format!("  • {n} — not on MACHINE_NAME_LIST: made all the same, but no proxy port (ssh to its own endpoint); add it to the list for one"),
-                            Color::Yellow,
-                        ),
+                        None if form.off_list() => (format!("  • {n} — {OFF_LIST}"), Color::Yellow),
                         None => (format!("  • {n}"), Color::Reset),
                     };
                     lines.push(Line::styled(text, Style::default().fg(tone)));
@@ -953,7 +965,7 @@ pub(crate) fn render_confirm(f: &mut Frame, form: &NewPodForm, offers: &offers::
     if form.custom_name().is_some() {
         lines.push(Line::from(format!("name: {}", names.join(", "))));
         if form.off_list() {
-            lines.push(Line::styled("not on MACHINE_NAME_LIST: no proxy port — reached on its own endpoint (add it to the list for one).", Style::default().fg(Color::Yellow)));
+            lines.push(Line::styled(OFF_LIST, Style::default().fg(Color::Yellow)));
         }
     } else {
         lines.push(Line::from(format!("names (free as of the last refresh): {}", if names.is_empty() { "picked by up".to_string() } else { names.join(", ") })));
@@ -1337,15 +1349,17 @@ mod tests {
         assert_eq!(f.custom_name().as_deref(), Some("arena8-autumn"));
         f.name = "keepsake".into();
         f.change(1);
-        assert_eq!(f.name, "apple", "from a typed name: the first free one");
+        f.change(-1);
+        assert_eq!(f.name, "keepsake", "a typed name stays: ⌫ clears it");
         // A free `@` entry is its bare name; none free: ←→ leaves it to the next free names.
         f.free = vec!["james-gpu".into()];
         f.name.clear();
         f.change(1);
         assert_eq!((f.name.as_str(), f.custom_name().as_deref()), ("james-gpu", Some("james-gpu")));
         f.free.clear();
+        f.name.clear();
         f.change(1);
         f.change(-1);
-        assert_eq!(f.custom_name(), None);
+        assert_eq!(f.custom_name(), None, "none free: ←→ leaves the next free names");
     }
 }

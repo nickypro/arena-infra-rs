@@ -903,7 +903,7 @@ async fn switching_provider_in_the_form_is_drawn_at_once_and_lists_nothing() {
 /// The human (2026-11-05), the list run out: "it should be possible to make custom name pod from
 /// arena-tui". Every name on the fixture's list is taken; on the name field (`↑` from the top) a
 /// name is typed — `j`/`k`/`l`/`o` type, not move — the confirm runs `up <name>`, saying it gets
-/// no proxy port; a taken name keeps the form, saying so.
+/// no proxy port nor archive copy; a taken name keeps the form, saying so.
 #[test]
 fn a_name_typed_in_the_form_is_the_pod_up_makes() {
     let mut fx = fixture_shared();
@@ -920,7 +920,7 @@ fn a_name_typed_in_the_form_is_the_pod_up_makes() {
     }
     let screen = frame(&ui);
     assert!(screen.contains("▶ name      ‹ devtest-jolly-kite▏ ›") && screen.contains("pods      ‹ 1 — the name below ›"), "{screen}");
-    assert!(screen.contains("not on MACHINE_NAME_LIST: made all the same, but no proxy port"), "{screen}");
+    assert!(screen.contains("not on MACHINE_NAME_LIST: made all the same, but no proxy port") && screen.contains("no archive copy"), "{screen}");
     assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
     assert!(matches!(ui.mode, Mode::UpConfirm(_)), "{:?}", ui.mode);
     let screen = frame(&ui);

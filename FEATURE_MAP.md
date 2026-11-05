@@ -249,8 +249,8 @@ background (`D`: every idle pod); `?` asks claude or codex about the cursor pod 
 (`pods ask`'s flow: the answer opens in a popup); `n` adds pods by running `arena pods up` (the
 form: provider, tier (RunPod), GPU type or Hetzner server type from the live catalogue, GPUs, disk,
 volume, `--check` (not on Hetzner), retry (`--retry-mins`: off/10m/30m/2h/24h), count, name (the next
-free list names, or one typed — `up <name>`, off the list too, which gets no proxy port — or a free
-list name picked with ←→); what `up` would try shown under it). Every fleet datum (cost, maintenance badge, proxy port + state,
+free list names, or one typed — `up <name>`, off the list too, which gets no proxy port or archive
+copy — or, from empty, a free list name picked with ←→); what `up` would try shown under it). Every fleet datum (cost, maintenance badge, proxy port + state,
 last health) comes from the same core `FleetSnapshot` as `arena snapshot`. A locked pod shows an
 `L` badge (when no `M`), and restart/stop/terminate on it are refused with the unlock hint — the
 TUI never unlocks (`arena pods unlock`).
