@@ -21,10 +21,10 @@ earlier).
 
 ## 2026-11-05 · ssh-config: no blank line between the per-machine Host blocks
 - `arena ssh-config` keeps the blank line after the shared `Host <prefix>-*` block, but the
-  per-machine blocks (`Host`/`Port` with `--proxy`, `Host`/`HostName`/`Port` without) now follow
-  each other without one. A machine named with `@` (whose block carries all its own options)
-  still has a blank line on each side. The `SSH_CONFIG_FILE` it keeps current is rewritten once
-  in the new layout.
+  per-machine blocks (`Host`/`Port` in the proxy layout, `Host`/`HostName`/`Port` in the direct
+  one) now follow each other without one. In the proxy layout, a machine named with `@` (whose
+  block carries all its own options) still has a blank line on each side. The `SSH_CONFIG_FILE`
+  it keeps current is rewritten once in the new layout.
 
 ## 2026-11-05 · the dashboard's add-pod form takes a pod name
 - The add-pod form (`n`) has a new last field, **name**. Type any name and the form makes one pod
