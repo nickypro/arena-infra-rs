@@ -191,6 +191,7 @@ pub(crate) fn mode_keys(mode: &Mode) -> &'static str {
         Mode::Confirm(_) => "[y] apply  [n/esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
+        Mode::NewPod(f) if f.selected() == newpod::NpField::Name => "type a name  [⌫] delete  [←→] a free one  [↑↓] field  [enter] review  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] field  [←→] change  [o] availability  [enter] review  [esc] cancel",
         Mode::UpConfirm(_) => "[y] create  [n/esc] back to the form",
         Mode::Runs { .. } => "[esc] hide (a run keeps going)  [←→] other runs  [↑↓ PgUp PgDn] scroll  [end] follow  [s] stop",
