@@ -59,8 +59,10 @@ pub fn render_manual(prefix: &str, user: &str, identity_file: &str, pods: &[Pod]
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, ip, port) in rows {
-        out.push_str(&format!("\nHost {name}\n    HostName {ip}\n    Port {port}\n"));
+    // One blank line after the wildcard block; the short per-pod blocks follow it unspaced.
+    for (i, (name, ip, port)) in rows.into_iter().enumerate() {
+        let gap = if i == 0 { "\n" } else { "" };
+        out.push_str(&format!("{gap}Host {name}\n    HostName {ip}\n    Port {port}\n"));
     }
     out
 }
@@ -78,6 +80,9 @@ pub fn render_proxy(
     candidates: &[String],
 ) -> String {
     let mut out = wildcard_block(prefix, user, identity_file, Some(proxy_host));
+    // A blank line after the wildcard block and around each self-contained block; the two-line
+    // prefixed blocks run on unspaced, one row per machine.
+    let mut gap = true;
     for (idx, entry) in candidates.iter().enumerate() {
         let port = starting_port as u32 + idx as u32;
         let Ok(port) = u16::try_from(port) else { continue };
@@ -90,8 +95,11 @@ pub fn render_proxy(
                  IdentityFile {identity_file}\n    UserKnownHostsFile=/dev/null\n    \
                  StrictHostKeyChecking=no\n    Port {port}\n"
             ));
+            gap = true;
         } else {
-            out.push_str(&format!("\nHost {name}\n    Port {port}\n"));
+            let sep = if gap { "\n" } else { "" };
+            out.push_str(&format!("{sep}Host {name}\n    Port {port}\n"));
+            gap = false;
         }
     }
     out
@@ -823,6 +831,11 @@ mod tests {
         let b = cfg.find("Host arena8-bloom").unwrap();
         assert!(a < b);
         assert!(cfg.contains("HostName 1.1.1.1\n    Port 22000"));
+        // a blank line after the wildcard block, none between the per-pod blocks
+        assert!(cfg.ends_with(
+            "StrictHostKeyChecking=no\n\nHost arena8-apple\n    HostName 1.1.1.1\n    Port 22000\n\
+             Host arena8-bloom\n    HostName 2.2.2.2\n    Port 22002\n"
+        ), "{cfg}");
         // unready pod absent
         assert!(!cfg.contains("arena8-cloud"));
     }
@@ -836,6 +849,13 @@ mod tests {
         assert!(cfg.contains("Host arena8-apple\n    Port 7000"));
         assert!(cfg.contains("Host arena8-autumn\n    Port 7001"));
         assert!(cfg.contains("Host arena8-bloom\n    Port 7002"));
+        // a blank line after the wildcard block, then one unspaced block per machine
+        assert!(cfg.ends_with(
+            "StrictHostKeyChecking=no\n\nHost arena8-apple\n    Port 7000\nHost arena8-autumn\n    Port 7001\n\
+             Host arena8-bloom\n    Port 7002\n"
+        ), "{cfg}");
+        // no machines: just the wildcard block, no trailing blank line
+        assert!(render_proxy("arena8", "root", "~/.ssh/arena8_key", "cute.sus.cat", 7000, &[]).ends_with("=no\n"));
     }
 
     /// The managed file's first line marks it as arena's: a sync writes a missing file or one of
@@ -1312,7 +1332,7 @@ mod tests {
 
     #[test]
     fn proxy_absolute_name_gets_bare_host_with_standalone_options() {
-        let candidates = ["apple".to_string(), "@james-gpu".into()].to_vec();
+        let candidates = ["apple".to_string(), "@james-gpu".into(), "bloom".into()].to_vec();
         let cfg = render_proxy("arena8", "root", "~/.ssh/arena8_key", "cute.sus.cat", 7000, &candidates);
         // prefixed machine relies on the wildcard: just Host + Port
         assert!(cfg.contains("Host arena8-apple\n    Port 7000"));
@@ -1325,5 +1345,8 @@ mod tests {
         ));
         // it must NOT be emitted as a prefixed host
         assert!(!cfg.contains("arena8-james-gpu"));
+        // set off by a blank line on each side, unlike the two-line blocks
+        assert!(cfg.contains("Port 7000\n\nHost james-gpu\n"), "{cfg}");
+        assert!(cfg.contains("Port 7001\n\nHost arena8-bloom\n    Port 7002\n"), "{cfg}");
     }
 }
