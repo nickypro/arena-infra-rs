@@ -19,11 +19,12 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
-## 2026-11-05 · ssh-config: one machine per two lines, no blank line between them
+## 2026-11-05 · ssh-config: no blank line between the per-machine Host blocks
 - `arena ssh-config` keeps the blank line after the shared `Host <prefix>-*` block, but the
-  per-machine `Host`/`Port` blocks now follow each other without one, so the list is half as
-  long. A machine named with `@` (whose block carries all its own options) still has a blank
-  line on each side. The `SSH_CONFIG_FILE` it keeps current is rewritten once in the new layout.
+  per-machine blocks (`Host`/`Port` with `--proxy`, `Host`/`HostName`/`Port` without) now follow
+  each other without one. A machine named with `@` (whose block carries all its own options)
+  still has a blank line on each side. The `SSH_CONFIG_FILE` it keeps current is rewritten once
+  in the new layout.
 
 ## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it
 - If files on a pod are removed or renamed while `pods pull` (or the backup's copy) reads them,
