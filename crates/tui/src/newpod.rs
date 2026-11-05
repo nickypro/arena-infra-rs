@@ -214,8 +214,11 @@ pub(crate) const RETRIES: [(&str, u64); 5] = [("off", 0), ("10 min", 10), ("30 m
 /// is.
 pub(crate) const RETRY_EVERY_SECS: u64 = 60;
 
-/// The longest name the name field takes (before the prefix): a hostname label is 63 at most.
+/// The longest name the name field takes (before the prefix).
 pub(crate) const NAME_MAX: usize = 40;
+
+/// The longest pod name, the prefix included: a hostname label's (Hetzner's server names).
+pub(crate) const LABEL_MAX: usize = 63;
 
 /// The add-pod form: `↑↓` moves between [`NpField`]s, `←→` changes the field's value. Pure.
 #[derive(Debug, Clone)]
@@ -402,12 +405,17 @@ impl NewPodForm {
         self.custom_name().is_some_and(|n| !self.list.iter().any(|e| naming::qualify(&self.prefix, e) == n))
     }
 
-    /// Why the form can't go on with its name: one a hostname can't be (a leading or trailing
-    /// `-`), or one a pod already has as of the last refresh. `None`: it can.
+    /// Why the form can't go on with its name: one a hostname label can't be — a leading or
+    /// trailing `-` (as typed, or once the prefix is on: one leading would read as `up`'s flag),
+    /// over [`LABEL_MAX`] with the prefix — or one a pod already has as of the last refresh
+    /// (`up` checks again against its own listing). `None`: it can.
     pub(crate) fn name_problem(&self) -> Option<String> {
         let n = self.custom_name()?;
-        if self.name.starts_with('-') || self.name.ends_with('-') {
+        if [self.name.as_str(), n.as_str()].iter().any(|s| s.starts_with('-') || s.ends_with('-')) {
             return Some(format!("✗ {n}: a name can't start or end with -"));
+        }
+        if n.len() > LABEL_MAX {
+            return Some(format!("✗ {n}: {} characters — {LABEL_MAX} at most, the prefix included", n.len()));
         }
         self.taken.contains(&n).then(|| format!("✗ {n} is taken — type another, or ←→ for a free one"))
     }
@@ -1290,6 +1298,7 @@ mod tests {
         assert_eq!(f.custom_name().as_deref(), Some("arena8-autumn"));
         f.name = "james-gpu".into();
         assert_eq!(f.custom_name().as_deref(), Some("james-gpu"));
+        assert!(!f.off_list(), "an `@` entry typed bare is on the list");
         // Taken, or not a hostname: Enter stays on the form, saying why.
         assert_eq!(f.name_problem().as_deref(), Some("✗ james-gpu is taken — type another, or ←→ for a free one"));
         f.name = "bloom".into();
@@ -1298,6 +1307,14 @@ mod tests {
         assert_eq!(f.name_problem().as_deref(), Some("✗ arena8-x-: a name can't start or end with -"));
         f.name = "a".repeat(NAME_MAX);
         assert!(!f.type_char('b'), "at most {NAME_MAX}");
+        // A long prefix: the whole name is a hostname label, 63 at most; an empty one would
+        // lead with `-`, which `up` would read as a flag.
+        f.prefix = "p".repeat(30);
+        assert!(f.name_problem().is_some_and(|w| w.contains("71 characters — 63 at most, the prefix included")), "{:?}", f.name_problem());
+        f.prefix.clear();
+        f.name = "solo".into();
+        assert_eq!(f.name_problem().as_deref(), Some("✗ -solo: a name can't start or end with -"));
+        f.prefix = "arena8".into();
         // Emptied: the next free names, as many as the count says.
         f.name.clear();
         f.type_char('z');
@@ -1321,5 +1338,14 @@ mod tests {
         f.name = "keepsake".into();
         f.change(1);
         assert_eq!(f.name, "apple", "from a typed name: the first free one");
+        // A free `@` entry is its bare name; none free: ←→ leaves it to the next free names.
+        f.free = vec!["james-gpu".into()];
+        f.name.clear();
+        f.change(1);
+        assert_eq!((f.name.as_str(), f.custom_name().as_deref()), ("james-gpu", Some("james-gpu")));
+        f.free.clear();
+        f.change(1);
+        f.change(-1);
+        assert_eq!(f.custom_name(), None);
     }
 }

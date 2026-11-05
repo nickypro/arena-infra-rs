@@ -927,11 +927,22 @@ fn a_name_typed_in_the_form_is_the_pod_up_makes() {
     assert!(screen.contains("$ arena --provider hetzner pods up devtest-jolly-kite --server-type cx33 --volume 0 --yes"), "{screen}");
     assert!(screen.contains("name: devtest-jolly-kite") && screen.contains("no proxy port"), "{screen}");
 
-    // Back to the form; a taken one: Enter stays, saying so.
+    // Back to the form: every letter, digit and `-` types — none closes or moves it.
     assert!(newpod::key(&mut ui, &shared, KeyCode::Esc));
     for _ in 0.."jolly-kite".len() {
         assert!(newpod::key(&mut ui, &shared, KeyCode::Backspace));
     }
+    let every: String = ('a'..='z').chain('0'..='9').chain(['-']).collect();
+    for c in every.chars() {
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Char(c)));
+    }
+    let Mode::NewPod(form) = &ui.mode else { panic!("{:?}", ui.mode) };
+    assert_eq!((form.name.as_str(), form.selected()), (every.as_str(), newpod::NpField::Name));
+    for _ in 0..every.len() {
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Backspace));
+    }
+
+    // A taken one: Enter stays, saying so.
     for c in "alpha".chars() {
         newpod::key(&mut ui, &shared, KeyCode::Char(c));
     }
