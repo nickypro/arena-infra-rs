@@ -311,14 +311,17 @@ fn strip_value(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The shipped `config.env.example` parses, with the original arena-infra's names, each one
-    /// once (a duplicate would hand two machines one proxy port) and fit for a host name.
+    /// The shipped `config.env.example` parses, with its 100 names (the original arena-infra's 55
+    /// and 45 more: the human, 2026-11-05, "add all 100 names to the config env example, but
+    /// sorted alphabetically"), each one once (a duplicate would hand two machines one proxy port)
+    /// and fit for a host name.
     #[test]
     fn the_example_config_s_names_parse_unique_and_host_safe() {
         let c = Config::parse(include_str!("../../../config.env.example"));
         let names = &c.machine_names;
-        assert_eq!(names.len(), 55, "{names:?}");
-        assert_eq!((names[0].as_str(), names[54].as_str()), ("apple", "zebra"));
+        assert_eq!(names.len(), 100, "{names:?}");
+        assert_eq!((names[0].as_str(), names[99].as_str()), ("apple", "zebra"));
+        assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted: {names:?}");
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "a name listed twice");
         for n in names {
