@@ -19,6 +19,17 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-05 · the dashboard's add-pod form takes a pod name
+- The add-pod form (`n`) has a new last field, **name**. Type any name and the form makes one pod
+  with it (`arena pods up <name>`), with the prefix added as the CLI adds it. On that field, `←→`
+  steps through the list's free names. Delete the name to get the old behaviour back: the next
+  free names, as many as **pods** says.
+- On the name field, letters are typed, so `j`/`k` don't move; use the arrow keys.
+- A name that isn't on `MACHINE_NAME_LIST` is still made, but it gets no proxy port. The form and
+  its confirm say so. To give it one, add the name to the list. Add it at the end, because a
+  name's place in the list is its port.
+- A name a pod already has (as of the last refresh) is refused, and the form stays open.
+
 ## 2026-11-03 · the backup's copy: files vanishing on a pod mid-copy no longer fail it
 - If files on a pod are removed or renamed while `pods pull` (or the backup's copy) reads them,
   rsync exits 24 and the pod's copy was counted as failed. Everything else was copied, so it now

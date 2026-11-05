@@ -61,6 +61,9 @@ pub(crate) enum NpField {
     /// `up --retry-mins N`: when there's no capacity, try again for up to N minutes ([`RETRIES`]).
     Retry,
     Pods,
+    /// The pod's name: the next free `MACHINE_NAME_LIST` names (`up --add N`), or one typed —
+    /// any name, the list's or not (`up <name>`) — or a free one of the list picked with `←→`.
+    Name,
 }
 
 /// A choice in the type field: a GPU type (`--gpu`), or a Hetzner server type (`--server-type`).
@@ -211,6 +214,9 @@ pub(crate) const RETRIES: [(&str, u64); 5] = [("off", 0), ("10 min", 10), ("30 m
 /// is.
 pub(crate) const RETRY_EVERY_SECS: u64 = 60;
 
+/// The longest name the name field takes (before the prefix): a hostname label is 63 at most.
+pub(crate) const NAME_MAX: usize = 40;
+
 /// The add-pod form: `↑↓` moves between [`NpField`]s, `←→` changes the field's value. Pure.
 #[derive(Debug, Clone)]
 pub(crate) struct NewPodForm {
@@ -238,6 +244,14 @@ pub(crate) struct NewPodForm {
     pub free: Vec<String>,
     /// The last refresh had listed the fleet when the form opened (else the names are a guess).
     pub listed: bool,
+    /// The name field as typed, without the prefix (`up` puts it on: [`Self::custom_name`]);
+    /// empty: the next free names.
+    pub name: String,
+    /// `MACHINE_NAME_PREFIX` and `MACHINE_NAME_LIST`, to spell a typed name as `up` will.
+    pub prefix: String,
+    pub list: Vec<String>,
+    /// The pod names the last refresh listed: a typed name one of them holds is refused.
+    pub taken: Vec<String>,
     /// Index into [`Self::fields`].
     pub field: usize,
     /// A change the form made by itself, said once (the tier switched to where a type is sold).
@@ -286,7 +300,7 @@ impl NewPodForm {
                 f.push(field);
             }
         }
-        f.extend([NpField::Retry, NpField::Pods]);
+        f.extend([NpField::Retry, NpField::Pods, NpField::Name]);
         f
     }
 
@@ -334,12 +348,77 @@ impl NewPodForm {
             NpField::Volume => self.volume_gb = (self.volume_gb as i32 + delta * 100).clamp(0, 2000) as u32,
             NpField::Check => self.check = !self.check,
             NpField::Retry => self.retry_idx = wrap(self.retry_idx, delta, RETRIES.len()),
+            // A name makes one pod: the count waits until the name is cleared.
+            NpField::Pods if self.custom_name().is_some() => {}
             NpField::Pods => {
                 let max = self.free.len().max(1) as i32;
                 self.count = (self.count as i32 + delta).clamp(1, max) as usize;
             }
+            NpField::Name => self.pick_free(delta),
         }
         false
+    }
+
+    /// `←→` on the name field: the next free name of the list in `delta`'s direction, past the
+    /// last back to none (the next free names); from a typed one, the first or the last.
+    fn pick_free(&mut self, delta: i32) {
+        let at = self.custom_name().and_then(|n| self.free.iter().position(|f| *f == n)).map_or(0, |i| i + 1);
+        let i = wrap(at, delta, self.free.len() + 1);
+        self.name = match i.checked_sub(1).and_then(|i| self.free.get(i)) {
+            Some(n) => n.strip_prefix(&format!("{}-", self.prefix)).unwrap_or(n).to_string(),
+            None => String::new(),
+        };
+    }
+
+    /// A key typed on the name field: a letter (lowercased), a digit or `-` — what a pod name
+    /// takes on every provider (Hetzner's are hostnames) — up to [`NAME_MAX`]; anything else is
+    /// dropped. `true`: it went in.
+    pub(crate) fn type_char(&mut self, c: char) -> bool {
+        self.note = None;
+        let c = c.to_ascii_lowercase();
+        let ok = (c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && self.name.len() < NAME_MAX;
+        if ok {
+            self.name.push(c);
+        }
+        ok
+    }
+
+    /// Backspace on the name field; emptied, it's the next free names again.
+    pub(crate) fn backspace(&mut self) {
+        self.note = None;
+        self.name.pop();
+    }
+
+    /// The one pod name the name field makes, as `up` spells it (the prefix on, an `@` entry's
+    /// bare: [`naming::canonical_name`]); `None`: the next free names.
+    pub(crate) fn custom_name(&self) -> Option<String> {
+        let t = self.name.trim();
+        (!t.is_empty()).then(|| naming::canonical_name(&self.prefix, &self.list, t))
+    }
+
+    /// The name is off `MACHINE_NAME_LIST`: `up` makes it all the same, but it gets no proxy port
+    /// (a name's place in the list is its port) — reached on its own endpoint.
+    pub(crate) fn off_list(&self) -> bool {
+        self.custom_name().is_some_and(|n| !self.list.iter().any(|e| naming::qualify(&self.prefix, e) == n))
+    }
+
+    /// Why the form can't go on with its name: one a hostname can't be (a leading or trailing
+    /// `-`), or one a pod already has as of the last refresh. `None`: it can.
+    pub(crate) fn name_problem(&self) -> Option<String> {
+        let n = self.custom_name()?;
+        if self.name.starts_with('-') || self.name.ends_with('-') {
+            return Some(format!("✗ {n}: a name can't start or end with -"));
+        }
+        self.taken.contains(&n).then(|| format!("✗ {n} is taken — type another, or ←→ for a free one"))
+    }
+
+    /// How many pods the form makes: one when it's named.
+    pub(crate) fn pods(&self) -> usize {
+        if self.custom_name().is_some() {
+            1
+        } else {
+            self.count
+        }
     }
 
     /// A type RunPod sells only on the other tier (a B300, the MIG slices: SECURE only): the tier
@@ -391,13 +470,17 @@ impl NewPodForm {
         RETRIES[self.retry_idx.min(RETRIES.len() - 1)].1
     }
 
-    /// The names the create would get as of the last refresh.
+    /// The names the create would get as of the last refresh — or the one typed.
     pub(crate) fn planned_names(&self) -> Vec<String> {
-        self.free.iter().take(self.count).cloned().collect()
+        match self.custom_name() {
+            Some(n) => vec![n],
+            None => self.free.iter().take(self.count).cloned().collect(),
+        }
     }
 
     /// `arena pods up`'s arguments for this form (the provider goes in `--provider`, the
-    /// runner's): `--add N` — `up` picks the names from its own whole-fleet listing — then the
+    /// runner's): the name typed, else `--add N` — `up` picks the names from its own whole-fleet
+    /// listing — then the
     /// type, and the fields the form shows for this provider ([`Self::fields`]: the flags its
     /// create takes): on Hetzner the server type; on a GPU provider the GPU type, GPUs per pod,
     /// RunPod's tier(s), disk and volume where it takes them, and `--check`; `--volume 0` where
@@ -405,7 +488,11 @@ impl NewPodForm {
     /// which Shadeform's create refuses, mustn't apply: review codex r1); then `--retry-mins N`
     /// when it retries. `--yes`: the dashboard's confirm has asked. Pure.
     pub(crate) fn up_args(&self) -> Vec<String> {
-        let mut a: Vec<String> = vec!["pods".into(), "up".into(), "--add".into(), self.count.to_string()];
+        let mut a: Vec<String> = vec!["pods".into(), "up".into()];
+        match self.custom_name() {
+            Some(n) => a.push(n),
+            None => a.extend(["--add".into(), self.count.to_string()]),
+        }
         let kind = self.kind().map(|k| k.id.clone()).unwrap_or_default();
         let fields = self.fields();
         if fields.contains(&NpField::GpuCount) {
@@ -486,6 +573,7 @@ pub(crate) fn build_form(cfg: &Config, launch_provider: &str, existing: &[Pod], 
         .unwrap_or(0);
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let free = naming::next_free_names(prefix, &cfg.machine_names, existing, usize::MAX);
+    let taken = existing.iter().map(|p| p.name.clone()).collect();
     let spec = PodSpec::from_config(cfg);
     let cloud_idx = CLOUDS.iter().position(|c| c.eq_ignore_ascii_case(spec.cloud_type.trim())).unwrap_or(0);
     let defaults = Defaults { gpu: spec.gpu_type.clone(), server: HetznerOpts::from_config(cfg).server_type };
@@ -506,6 +594,10 @@ pub(crate) fn build_form(cfg: &Config, launch_provider: &str, existing: &[Pod], 
         count: 1,
         free,
         listed,
+        name: String::new(),
+        prefix: prefix.to_string(),
+        list: cfg.machine_names.clone(),
+        taken,
         field: 0,
         note: None,
     };
@@ -560,6 +652,11 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> bo
                     ui.mode = Mode::List;
                     return true;
                 }
+                // On the name field a letter is typed — `j`/`k`/`h`/`l`/`o` too; the arrows move.
+                KeyCode::Char(c) if form.selected() == NpField::Name => {
+                    form.type_char(c);
+                }
+                KeyCode::Backspace if form.selected() == NpField::Name => form.backspace(),
                 KeyCode::Up | KeyCode::Char('k') => form.move_field(-1),
                 KeyCode::Down | KeyCode::Char('j') => form.move_field(1),
                 KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
@@ -571,6 +668,11 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> bo
                 }
                 KeyCode::Char('o') => ui.offers.show = !ui.offers.show,
                 KeyCode::Enter => {
+                    if let Some(why) = form.name_problem() {
+                        form.note = Some(why);
+                        ui.mode = Mode::NewPod(form);
+                        return true;
+                    }
                     ui.mode = if form.kind().is_none() {
                         Mode::Result("✗ nothing to create: no type to choose".into())
                     } else {
@@ -606,7 +708,10 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode) -> bo
 fn up_title(form: &NewPodForm) -> String {
     let kind = form.kind().map_or("?", |k| k.label.as_str());
     let retry = if form.retry_mins() > 0 { format!(", retrying up to {}", retry_span(form.retry_mins())) } else { String::new() };
-    format!("pods up: {} × {kind} on {}{retry}", form.count, form.provider_name())
+    match form.custom_name() {
+        Some(n) => format!("pods up: {n} · {kind} on {}{retry}", form.provider_name()),
+        None => format!("pods up: {} × {kind} on {}{retry}", form.count, form.provider_name()),
+    }
 }
 
 /// `10 min`, `2 h`, `24 h` — a retry window as the form names it.
@@ -681,7 +786,17 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
             NpField::Volume => ("volume", if form.volume_gb == 0 { "none".to_string() } else { format!("{}GB", form.volume_gb) }),
             NpField::Check => ("check", if form.check { "deep-check, replace a bad host".into() } else { "off".to_string() }),
             NpField::Retry => ("retry", retry_words(form.retry_mins())),
+            NpField::Pods if form.custom_name().is_some() => ("pods", "1 — the name below".to_string()),
             NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
+            NpField::Name => (
+                "name",
+                match form.custom_name() {
+                    Some(n) if selected => format!("{n}▏"),
+                    Some(n) => n,
+                    None if selected => "▏ next free — type one, or ←→".into(),
+                    None => "next free".into(),
+                },
+            ),
         };
         let marker = if selected { "▶ " } else { "  " };
         lines.push(Line::from(vec![
@@ -757,6 +872,29 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
                 lines.push(Line::styled(format!("  {mark} {label}"), if i == form.retry_idx { cur } else { Style::default() }));
             }
         }
+        NpField::Name => {
+            lines.push(Line::styled("the pod's name — typed (the prefix goes on), or a free one of MACHINE_NAME_LIST with ←→; ⌫ back to the next free:", label));
+            match form.custom_name() {
+                None => lines.push(Line::styled(format!("  next free: {}", form.planned_names().join(", ")), dim)),
+                Some(n) => {
+                    let (text, tone) = match form.name_problem() {
+                        Some(why) => (format!("  {why}"), Color::Red),
+                        None if form.off_list() => (
+                            format!("  • {n} — not on MACHINE_NAME_LIST: made all the same, but no proxy port (ssh to its own endpoint); add it to the list for one"),
+                            Color::Yellow,
+                        ),
+                        None => (format!("  • {n}"), Color::Reset),
+                    };
+                    lines.push(Line::styled(text, Style::default().fg(tone)));
+                }
+            }
+            let free: Vec<&str> = form.free.iter().map(String::as_str).take(12).collect();
+            if !free.is_empty() {
+                let more = form.free.len().saturating_sub(free.len());
+                let more = if more > 0 { format!(" … +{more}") } else { String::new() };
+                lines.push(Line::styled(format!("  free on the list: {}{more}", free.join(", ")), dim));
+            }
+        }
         NpField::Pods => {
             lines.push(Line::styled(if form.listed { "will create (free as of the last refresh — up re-checks):" } else { "will create (the fleet isn't listed yet — up picks free names):" }, label));
             let planned = form.planned_names();
@@ -774,7 +912,14 @@ pub(crate) fn render(f: &mut Frame, form: &NewPodForm, offers: &offers::State) {
     lines.push(Line::from(""));
     lines.extend(availability(form, offers));
     lines.push(Line::from(""));
-    lines.push(Line::styled("[↑↓] field   [←→] change   [o] availability   [enter] review   [esc] cancel", dim));
+    lines.push(Line::styled(
+        if sel == NpField::Name {
+            "[↑↓] field   type a name   [⌫] delete   [←→] a free one   [enter] review   [esc] cancel"
+        } else {
+            "[↑↓] field   [←→] change   [o] availability   [enter] review   [esc] cancel"
+        },
+        dim,
+    ));
 
     let area = centered_rect(70, 85, f.area());
     f.render_widget(Clear, area);
@@ -792,14 +937,21 @@ pub(crate) fn render_confirm(f: &mut Frame, form: &NewPodForm, offers: &offers::
     let dim = Style::default().fg(Color::DarkGray);
     let names = form.planned_names();
     let mut lines = vec![
-        Line::styled(format!("create {} pod(s) on {} and set each up, as `arena pods up` does:", form.count, form.provider_name()), Style::default().add_modifier(Modifier::BOLD)),
+        Line::styled(format!("create {} pod(s) on {} and set each up, as `arena pods up` does:", form.pods(), form.provider_name()), Style::default().add_modifier(Modifier::BOLD)),
         Line::from(""),
         Line::styled(format!("  $ {}", command_line(form)), Style::default().fg(Color::Cyan)),
         Line::from(""),
-        Line::from(format!("names (free as of the last refresh): {}", if names.is_empty() { "picked by up".to_string() } else { names.join(", ") })),
-        Line::styled("up lists the whole fleet again first, and refuses if a provider doesn't answer.", dim),
-        Line::from(""),
     ];
+    if form.custom_name().is_some() {
+        lines.push(Line::from(format!("name: {}", names.join(", "))));
+        if form.off_list() {
+            lines.push(Line::styled("not on MACHINE_NAME_LIST: no proxy port — reached on its own endpoint (add it to the list for one).", Style::default().fg(Color::Yellow)));
+        }
+    } else {
+        lines.push(Line::from(format!("names (free as of the last refresh): {}", if names.is_empty() { "picked by up".to_string() } else { names.join(", ") })));
+    }
+    lines.push(Line::styled("up lists the whole fleet again first, and refuses if a provider doesn't answer.", dim));
+    lines.push(Line::from(""));
     if form.retry_mins() > 0 {
         let until = arena_core::snapshot::unix_now() + form.retry_mins() * 60;
         lines.push(Line::styled(
@@ -858,8 +1010,12 @@ mod tests {
             count: 1,
             free: vec!["arena8-apple".into(), "arena8-autumn".into()],
             listed: true,
+            name: String::new(),
+            prefix: "arena8".into(),
+            list: vec!["bloom".into(), "apple".into(), "autumn".into(), "@james-gpu".into()],
+            taken: vec!["arena8-bloom".into(), "james-gpu".into()],
             field: 0,
-        note: None,
+            note: None,
         };
         f.set_kinds(preset_kinds("runpod", &defaults()), Source::Loading);
         f
@@ -879,10 +1035,10 @@ mod tests {
     fn fields_depend_on_provider() {
         let mut f = form();
         use NpField::*;
-        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods]);
+        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods, Name]);
         assert!(f.change(1), "runpod → hetzner (vast has no key)");
         assert_eq!(f.provider_name(), "hetzner");
-        assert_eq!(f.fields(), [Provider, Kind, Retry, Pods], "a CPU VM: its server type, no GPU count, cloud, disk or check");
+        assert_eq!(f.fields(), [Provider, Kind, Retry, Pods, Name], "a CPU VM: its server type, no GPU count, cloud, disk or check");
         assert_eq!(f.cloud(), None);
         // From the capability table: Vast takes no volume (and the form offers RunPod's tiers
         // only); Shadeform neither a tier, a disk nor a volume.
@@ -890,16 +1046,16 @@ mod tests {
         f.providers[3].available = true;
         f.change(-1);
         assert_eq!(f.provider_name(), "vast");
-        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Disk, Check, Retry, Pods]);
+        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Disk, Check, Retry, Pods, Name]);
         f.change(1);
         f.change(1);
         assert_eq!(f.provider_name(), "shadeform");
-        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Check, Retry, Pods]);
+        assert_eq!(f.fields(), [Provider, Kind, GpuCount, Check, Retry, Pods, Name]);
         // On RunPod v1, as on v2.
         f.providers[0].backend = Some(Backend::RunpodV1);
         f.change(1);
         assert_eq!(f.provider_name(), "runpod");
-        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods]);
+        assert_eq!(f.fields(), [Provider, CloudType, Kind, GpuCount, Disk, Volume, Check, Retry, Pods, Name]);
     }
 
     /// Whatever the form sends, the create target takes: no flag `up` would refuse as ignored
@@ -1099,5 +1255,71 @@ mod tests {
             f.change(1);
         }
         assert_eq!(f.count, 2, "capped at the free names");
+    }
+
+    /// The human (2026-11-05): "it should be possible to make custom name pod from arena-tui" —
+    /// the list had run out. A typed name makes one pod of it (`up <name>`, the prefix on), off
+    /// the list or not; a hostname's characters only; emptied, the next free names again.
+    #[test]
+    fn a_typed_name_makes_one_pod_of_that_name() {
+        let mut f = form();
+        f.count = 2;
+        f.field = f.fields().iter().position(|x| *x == NpField::Name).unwrap();
+        assert_eq!(f.custom_name(), None);
+        assert_eq!(f.planned_names(), ["arena8-apple", "arena8-autumn"]);
+        for c in "Keep sake_!".chars() {
+            f.type_char(c);
+        }
+        assert_eq!(f.name, "keepsake", "lowercased; a space, _ and ! dropped");
+        assert_eq!(f.custom_name().as_deref(), Some("arena8-keepsake"));
+        assert_eq!((f.planned_names(), f.pods()), (vec!["arena8-keepsake".to_string()], 1));
+        assert!(f.off_list() && f.name_problem().is_none());
+        assert_eq!(
+            f.up_args(),
+            ["pods", "up", "arena8-keepsake", "--gpu", "NVIDIA RTX A4000", "--gpus", "1", "--cloud", "COMMUNITY", "--disk", "100", "--volume", "0", "--yes"]
+        );
+        assert_eq!(up_title(&f), "pods up: arena8-keepsake · RTX A4000 · 16GB on runpod");
+        // The count waits while it's named.
+        f.field -= 1;
+        f.change(-1);
+        assert_eq!(f.count, 2);
+        // A list name, typed bare or in full: on the list; an `@` entry's bare.
+        f.name = "autumn".into();
+        assert!(!f.off_list());
+        f.name = "arena8-autumn".into();
+        assert_eq!(f.custom_name().as_deref(), Some("arena8-autumn"));
+        f.name = "james-gpu".into();
+        assert_eq!(f.custom_name().as_deref(), Some("james-gpu"));
+        // Taken, or not a hostname: Enter stays on the form, saying why.
+        assert_eq!(f.name_problem().as_deref(), Some("✗ james-gpu is taken — type another, or ←→ for a free one"));
+        f.name = "bloom".into();
+        assert!(f.name_problem().is_some_and(|w| w.contains("arena8-bloom is taken")));
+        f.name = "x-".into();
+        assert_eq!(f.name_problem().as_deref(), Some("✗ arena8-x-: a name can't start or end with -"));
+        f.name = "a".repeat(NAME_MAX);
+        assert!(!f.type_char('b'), "at most {NAME_MAX}");
+        // Emptied: the next free names, as many as the count says.
+        f.name.clear();
+        f.type_char('z');
+        f.backspace();
+        assert_eq!((f.planned_names().len(), f.up_args()[2].as_str()), (2, "--add"));
+    }
+
+    /// `←→` on the name field steps through the list's free names, then back to none.
+    #[test]
+    fn arrows_on_the_name_field_pick_a_free_list_name() {
+        let mut f = form();
+        f.field = f.fields().iter().position(|x| *x == NpField::Name).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            f.change(1);
+            seen.push(f.name.clone());
+        }
+        assert_eq!(seen, ["apple", "autumn", ""]);
+        f.change(-1);
+        assert_eq!(f.custom_name().as_deref(), Some("arena8-autumn"));
+        f.name = "keepsake".into();
+        f.change(1);
+        assert_eq!(f.name, "apple", "from a typed name: the first free one");
     }
 }

@@ -900,6 +900,46 @@ async fn switching_provider_in_the_form_is_drawn_at_once_and_lists_nothing() {
     assert!(matches!(ui.mode, Mode::NewPod(_)));
 }
 
+/// The human (2026-11-05), the list run out: "it should be possible to make custom name pod from
+/// arena-tui". Every name on the fixture's list is taken; on the name field (`↑` from the top) a
+/// name is typed — `j`/`k`/`l`/`o` type, not move — the confirm runs `up <name>`, saying it gets
+/// no proxy port; a taken name keeps the form, saying so.
+#[test]
+fn a_name_typed_in_the_form_is_the_pod_up_makes() {
+    let mut fx = fixture_shared();
+    fx.last_refresh = Some(Instant::now());
+    let shared = Arc::new(Mutex::new(fx));
+    let mut ui = ui(cfg("HETZNER_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+    let frame = |ui: &Ui| draw(140, 45, &shared.lock().unwrap(), ui).join("\n");
+    newpod::open(&mut ui, &shared);
+    assert!(newpod::key(&mut ui, &shared, KeyCode::Up), "↑ from the top: the name field");
+    let screen = frame(&ui);
+    assert!(screen.contains("▶ name      ‹ ▏ next free — type one, or ←→ ›") && screen.contains("type a name"), "{screen}");
+    for c in "jolly-kite".chars() {
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Char(c)));
+    }
+    let screen = frame(&ui);
+    assert!(screen.contains("▶ name      ‹ devtest-jolly-kite▏ ›") && screen.contains("pods      ‹ 1 — the name below ›"), "{screen}");
+    assert!(screen.contains("not on MACHINE_NAME_LIST: made all the same, but no proxy port"), "{screen}");
+    assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
+    assert!(matches!(ui.mode, Mode::UpConfirm(_)), "{:?}", ui.mode);
+    let screen = frame(&ui);
+    assert!(screen.contains("$ arena --provider hetzner pods up devtest-jolly-kite --server-type cx33 --volume 0 --yes"), "{screen}");
+    assert!(screen.contains("name: devtest-jolly-kite") && screen.contains("no proxy port"), "{screen}");
+
+    // Back to the form; a taken one: Enter stays, saying so.
+    assert!(newpod::key(&mut ui, &shared, KeyCode::Esc));
+    for _ in 0.."jolly-kite".len() {
+        assert!(newpod::key(&mut ui, &shared, KeyCode::Backspace));
+    }
+    for c in "alpha".chars() {
+        newpod::key(&mut ui, &shared, KeyCode::Char(c));
+    }
+    assert!(newpod::key(&mut ui, &shared, KeyCode::Enter));
+    let Mode::NewPod(form) = &ui.mode else { panic!("{:?}", ui.mode) };
+    assert_eq!(form.note.as_deref(), Some("✗ devtest-alpha is taken — type another, or ←→ for a free one"));
+}
+
 /// Live ASK4 3c (lane ASK8 item 4), review ai-review claude #1 (lane ASK9 item 1): a hangup or
 /// a TERM ends the dashboard from a task of its own — never by way of its event loop, which a
 /// hung-up terminal never lets come round again (crossterm's read spins) — stopping a question
