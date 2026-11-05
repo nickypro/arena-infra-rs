@@ -517,8 +517,12 @@ pub fn new_build_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
-    let last = LAST.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(now.max(last + 1))).unwrap_or(0);
-    format!("{}-{}", now.max(last + 1), std::process::id())
+    let mut nanos = now;
+    let _ = LAST.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+        nanos = now.max(last.saturating_add(1));
+        Some(nanos)
+    });
+    format!("{nanos}-{}", std::process::id())
 }
 
 /// The scrub script, rendered: the secret patterns the backup redacts (plus private keys) for its
