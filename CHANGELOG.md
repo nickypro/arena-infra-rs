@@ -19,6 +19,17 @@ alone tells releases apart. Say the new version in the entry that bumps it.
 Before this file, see the merged pull requests on GitHub (master `a335316`, 2026-10-21, and
 earlier).
 
+## 2026-11-05 · config.env.example lists 100 machine names
+- The example's `MACHINE_NAME_LIST` now has 100 names: the original 55 and 45 more, chosen to be
+  short and spelled as they sound. The list is sorted alphabetically.
+- In the example, `bulk` is now `bolt`.
+
+### Config
+- Your `config.env` is not changed. A name's place in the list is its proxy port, so a config
+  with pods running keeps its own order and only appends: don't copy the new list over it, and
+  don't sort it or rename a name in it (a config with `bulk` keeps `bulk`). To use the new names,
+  add the ones you want at the end of your list.
+
 ## 2026-11-05 · ssh-config: no blank line between the per-machine Host blocks
 - `arena ssh-config` keeps the blank line after the shared `Host <prefix>-*` block, but the
   per-machine blocks (`Host`/`Port` in the proxy layout, `Host`/`HostName`/`Port` in the direct
