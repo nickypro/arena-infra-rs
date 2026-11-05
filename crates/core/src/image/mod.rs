@@ -510,10 +510,15 @@ pub fn build_vm_labels(scope: &Scope, build_id: &str) -> Map<String, Value> {
 
 /// A bake's own id (unix nanoseconds and the pid): on its VM and its snapshot, so a bake whose
 /// create (or snapshot) answer never came finds what it made — and only that, never another
-/// bake's of the same name. Impure (the clock).
+/// bake's of the same name. The nanoseconds only go up within a process: macOS's clock moves in
+/// whole microseconds, so two ids made in one gave the same id (master's macOS CI, 2026-11-05:
+/// `1793892157416809000-94663` twice). Impure (the clock).
 pub fn new_build_id() -> String {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("{nanos}-{}", std::process::id())
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let last = LAST.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(now.max(last + 1))).unwrap_or(0);
+    format!("{}-{}", now.max(last + 1), std::process::id())
 }
 
 /// The scrub script, rendered: the secret patterns the backup redacts (plus private keys) for its

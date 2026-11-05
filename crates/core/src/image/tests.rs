@@ -248,8 +248,11 @@ fn the_build_vm_and_snapshot_are_named_and_labelled_as_ours() {
     }
     let vm = build_vm_labels(&scope(), "7-1");
     assert_eq!(Value::Object(vm), json!({"arena-image-build": "devtest", "arena-prefix": "devtest", "arena-image-build-id": "7-1"}));
-    let (a, b) = (new_build_id(), new_build_id());
-    assert!(a != b && label_value(&a) == a, "{a} {b}");
+    // Made back to back, each its own — on macOS too, whose clock moves in whole microseconds.
+    let ids: Vec<String> = (0..1000).map(|_| new_build_id()).collect();
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "{:?}", &ids[..3]);
+    assert_eq!(label_value(&ids[0]), ids[0]);
     assert_eq!(scope().selector(LABEL), "arena-image=1,arena-prefix=devtest");
     assert_eq!(scope().selector(BUILD_LABEL), "arena-image-build=devtest");
 }
