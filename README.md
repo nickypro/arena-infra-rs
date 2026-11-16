@@ -13,12 +13,34 @@
 
 </div>
 
-A streamlined Rust rewrite of [`arena-infra`](https://github.com/nickypro/arena-infra) — the
-control plane for ARENA's GPU pods. Goals: multi-provider machine spin-up, a tidy commit/backup
-flow, a performance/GPU/progress dashboard, and robust port forwarding, behind both a CLI and an
-interactive TUI. `arena` creates the cohort's pods on RunPod, Vast.ai, Hetzner or Shadeform, sets
-each one up, gives every machine a stable SSH address, and backs the participants' work up every
-15 minutes.
+`arena` creates a cohort's machines on RunPod, Vast.ai, Hetzner or Shadeform, sets each one up,
+gives it an SSH address that never changes, and backs the participants' work up every 15 minutes.
+It is one CLI and a live dashboard, run from one control box.
+
+![The dashboard during ARENA 9's project week: 55 machines on Hetzner, RunPod and Vast](docs/img/dashboard-2026-11-02.png)
+
+<sup>`arena tui`, live during ARENA 9's project week: 55 machines on Hetzner, RunPod and Vast.
+[How to read it](#the-dashboard).</sup>
+
+**Just want a few GPU pods?** [Quick start](#just-want-some-gpu-pods), with one API key.
+**Running a cohort?** [Getting started](#getting-started).
+
+## How it works
+
+An organiser runs `arena` on a control box: an always-on server for a cohort, or a laptop for a
+few pods of your own. `arena` asks the providers' APIs for machines named from a list
+(`arena-apple`, `arena-bloom`, …), then SSHes into each one to provision it: the cohort's repo, a
+deploy key, API tokens, a warmed-up VS Code server. Participants connect with VS Code Remote-SSH
+through an nginx proxy that gives every machine one stable port. A provider moves a pod's
+endpoint whenever it restarts; `arena` rewrites the proxy's forwards, so nobody's `~/.ssh/config`
+has to change.
+
+Cron then does the routine work. Every 15 minutes each pod's work is pushed to its own day branch
+on GitHub and its home directory is rsynced to the control box, and every 5 the proxy is synced
+again. The dashboard shows each machine's GPU load, disk, cost, health and last backup. A broken
+pod is replaced by a fresh one with the same name, port and files. Every command that changes
+something shows what it will do and asks first, because it runs against a live cohort. It is a
+Rust rewrite of the original [`arena-infra`](https://github.com/nickypro/arena-infra) scripts.
 
 ```mermaid
 flowchart LR
@@ -33,7 +55,7 @@ flowchart LR
   course["course repo<br/>(upstream)"] -. "git pull upstream main" .-> pods
 ```
 
-## TL;DR
+## Quick start
 
 ### Just want some GPU pods?
 
@@ -148,14 +170,14 @@ unambiguous prefix (`arena po li` = `arena pods list`). Pods are named
 
 ## Getting started
 
-The cohort route, in order. Only want pods? [The TL;DR](#just-want-some-gpu-pods) is all of it.
+The cohort route, in order. Only want pods? [The quick start](#just-want-some-gpu-pods) is all of it.
 
 ### 1. Install
 
 Every release has `arena` and `arena-tui` for Linux (x86_64 and arm64; glibc 2.35 or newer, as
 on Ubuntu 22.04) and for macOS 11 or newer (Apple silicon and Intel). This picks yours, checks it
 against the release's `SHA256SUMS`, and puts both binaries and `config.env.example` in `~/arena`
-(the same block as the TL;DR's):
+(the same block as the quick start's):
 
 ```bash
 (set -eu; mkdir -p ~/arena; cd ~/arena
@@ -171,7 +193,7 @@ against the release's `SHA256SUMS`, and puts both binaries and `config.env.examp
 Nothing is installed unless all three match. Run again, it installs the latest release over the
 one there (`arena update` does that too, and verifies more: below).
 
-Put `~/arena` on your `PATH`, or alias `arena` as the TL;DR does: `arena tui` starts the
+Put `~/arena` on your `PATH`, or alias `arena` as the quick start does: `arena tui` starts the
 `arena-tui` beside it. On Windows, run the block in [WSL](https://learn.microsoft.com/windows/wsl/install)
 (Ubuntu): the Linux binaries work there. On a Mac, pulling backups (`pods pull`, `pods backup`)
 needs rsync 3 (`brew install rsync`): macOS's own lacks options arena uses. The control box's
@@ -332,13 +354,12 @@ flowchart LR
 every few seconds. Every action on a pod asks first; restart, stop and terminate need the pod's
 name typed back.
 
-![The dashboard during ARENA 9's project week: 55 machines on Hetzner, RunPod and Vast](docs/img/dashboard-2026-11-02.png)
-
-<sup>Live, ARENA 9's project week (2026-11-02). **Top line:** per provider, the machine count,
-balance, time left and $/h; `⚠` where something needs you. **Rows:** P = provider (H/R/V); SET =
-`.name`, deploy key, origin, API key (`✗` = missing); HLTH = last deep check; PROXY = the
-participant's port; 💾 = the course repo's last commit; AI$ = AI key spend / cap. Red or orange
-means look at it, e.g. a disk nearly full or RAM at 99%. `i` explains every column.</sup>
+The [screenshot at the top](#arena-infra-rs) is ARENA 9's project week (2026-11-02). **Top
+line:** per provider, the machine count, balance, time left and $/h; `⚠` where something needs
+you. **Rows:** P = provider (H/R/V); SET = `.name`, deploy key, origin, API key (`✗` = missing);
+HLTH = last deep check; PROXY = the participant's port; 💾 = the course repo's last commit; AI$ =
+AI key spend / cap. Red or orange means look at it, e.g. a disk nearly full or RAM at 99%. `i`
+explains every column.
 
 The same layout from a made-up fleet, as text:
 
