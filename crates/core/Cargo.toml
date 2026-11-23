@@ -25,7 +25,7 @@ ring = "0.17"
 # compiled in), and aws-lc-rs as its crypto (a C build like ring's; no OpenSSL). It re-exports
 # the trust root and bundle types (`sigstore_verify::{trust_root, types}`). Pinned exactly: a
 # new version is a deliberate edit here, read first (Dependabot's `verification` group).
-sigstore-verify = { version = "=0.15.1", default-features = false, features = ["aws-lc-rs"] }
+sigstore-verify = { version = "=0.16.0", default-features = false, features = ["aws-lc-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` for a graceful stop of a timed-out ssh/scp child (remote.rs);
